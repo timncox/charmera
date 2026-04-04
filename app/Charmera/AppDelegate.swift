@@ -1,10 +1,14 @@
 import AppKit
-import UserNotifications
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var pollTimer: Timer?
     private var isImporting = false
+
+    private let setupController = SetupWindowController()
+    private let prefsController = PreferencesWindowController()
+
+    // MARK: - App Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -13,8 +17,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         if let button = statusItem.button {
             button.title = "K"
-            button.action = #selector(statusItemClicked)
             button.target = self
+            button.action = #selector(statusItemLeftClicked)
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
         updateIcon()
@@ -22,7 +27,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.updateIcon()
         }
+
+        // Register for URL scheme callbacks
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleURLEvent(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kInternetEventClass),
+            andEventID: AEEventID(kAEGetURL)
+        )
+
+        // Show setup if no token
+        if KeychainHelper.githubToken == nil {
+            setupController.show()
+        }
     }
+
+    // MARK: - URL Scheme Handling
+
+    @objc private func handleURLEvent(_ event: NSAppleEventDescriptor, withReplyEvent reply: NSAppleEventDescriptor) {
+        guard let urlString = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue,
+              let url = URL(string: urlString),
+              url.scheme == Config.githubCallbackScheme,
+              url.host == "callback" else {
+            return
+        }
+
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        guard let code = components?.queryItems?.first(where: { $0.name == "code" })?.value else {
+            return
+        }
+
+        setupController.handleCallback(code: code)
+    }
+
+    // MARK: - Status Item
 
     private var isCameraConnected: Bool {
         FileManager.default.fileExists(atPath: Config.cameraVolumePath)
@@ -31,28 +69,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateIcon() {
         guard let button = statusItem.button else { return }
 
+        let color: NSColor
         if isImporting {
-            let attrs: [NSAttributedString.Key: Any] = [
-                .foregroundColor: NSColor.systemBlue,
-                .font: NSFont.systemFont(ofSize: 14, weight: .bold)
-            ]
-            button.attributedTitle = NSAttributedString(string: "K", attributes: attrs)
+            color = .systemBlue
         } else if isCameraConnected {
-            let attrs: [NSAttributedString.Key: Any] = [
-                .foregroundColor: NSColor(red: 1.0, green: 0.718, blue: 0.0, alpha: 1.0), // #ffb700
-                .font: NSFont.systemFont(ofSize: 14, weight: .bold)
-            ]
-            button.attributedTitle = NSAttributedString(string: "K", attributes: attrs)
+            color = NSColor(red: 1.0, green: 0.718, blue: 0.0, alpha: 1.0)
         } else {
-            let attrs: [NSAttributedString.Key: Any] = [
-                .foregroundColor: NSColor.gray,
-                .font: NSFont.systemFont(ofSize: 14, weight: .bold)
-            ]
-            button.attributedTitle = NSAttributedString(string: "K", attributes: attrs)
+            color = .gray
+        }
+
+        let attrs: [NSAttributedString.Key: Any] = [
+            .foregroundColor: color,
+            .font: NSFont.systemFont(ofSize: 14, weight: .bold),
+        ]
+        button.attributedTitle = NSAttributedString(string: "K", attributes: attrs)
+    }
+
+    // MARK: - Click Handling
+
+    @objc private func statusItemLeftClicked() {
+        guard let event = NSApp.currentEvent else { return }
+
+        if event.type == .rightMouseUp {
+            showContextMenu()
+        } else {
+            handleImport()
         }
     }
 
-    @objc private func statusItemClicked() {
+    private func handleImport() {
+        guard KeychainHelper.githubToken != nil else {
+            setupController.show()
+            return
+        }
+
         guard !isImporting else { return }
         guard isCameraConnected else {
             showNotification(title: "Charmera", body: "No camera detected. Connect the Kodak Charmera and try again.")
@@ -86,8 +136,67 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - Context Menu
+
+    private func showContextMenu() {
+        let menu = NSMenu()
+
+        if let username = KeychainHelper.githubUsername {
+            let galleryURL = "https://\(username).github.io/\(Config.repoName)/"
+            let openGallery = NSMenuItem(title: "Open Gallery", action: #selector(openGalleryAction(_:)), keyEquivalent: "")
+            openGallery.target = self
+            openGallery.representedObject = galleryURL
+            menu.addItem(openGallery)
+        }
+
+        let importItem = NSMenuItem(title: "Import", action: #selector(importMenuAction), keyEquivalent: "")
+        importItem.target = self
+        importItem.isEnabled = !isImporting && isCameraConnected
+        menu.addItem(importItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let prefs = NSMenuItem(title: "Preferences...", action: #selector(showPreferences), keyEquivalent: ",")
+        prefs.target = self
+        menu.addItem(prefs)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let quit = NSMenuItem(title: "Quit Charmera", action: #selector(quitApp), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
+
+        statusItem.menu = menu
+        statusItem.button?.performClick(nil)
+        statusItem.menu = nil // Reset so left click still works
+    }
+
+    @objc private func openGalleryAction(_ sender: NSMenuItem) {
+        if let urlString = sender.representedObject as? String,
+           let url = URL(string: urlString) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc private func importMenuAction() {
+        handleImport()
+    }
+
+    @objc private func showPreferences() {
+        if KeychainHelper.githubToken == nil {
+            setupController.show()
+        } else {
+            prefsController.show()
+        }
+    }
+
+    @objc private func quitApp() {
+        NSApp.terminate(nil)
+    }
+
+    // MARK: - Notifications
+
     private func showNotification(title: String, body: String) {
-        // Use osascript — works without entitlements for a CLI-built app
         let safeTitle = title.replacingOccurrences(of: "\"", with: "\\\"")
         let safeBody = body.replacingOccurrences(of: "\"", with: "\\\"")
         let proc = Process()

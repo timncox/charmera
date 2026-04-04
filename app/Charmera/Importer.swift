@@ -18,9 +18,15 @@ class Importer {
     }
 
     private func performImport() throws -> ImportCounts {
-        // Ensure backup root exists
         let fm = FileManager.default
         try fm.createDirectory(atPath: Config.localBackupRoot, withIntermediateDirectories: true)
+
+        guard let token = KeychainHelper.githubToken,
+              let username = KeychainHelper.githubUsername else {
+            throw ImportError.notAuthenticated
+        }
+
+        let api = GitHubAPI(token: token)
 
         // 1. Discover files
         let dcimURL = URL(fileURLWithPath: Config.cameraVolumePath)
@@ -72,23 +78,24 @@ class Importer {
             allHashes.append(item.hash)
         }
 
-        // 4. Detect orientation and rotate photos (local Vision framework)
+        // 4. Detect orientation and rotate photos
         for photoPath in localPhotos {
             let degrees = OrientationDetector.detectRotation(imagePath: photoPath)
             if degrees != 0 {
-                print("[Importer] Rotating \(URL(fileURLWithPath: photoPath).lastPathComponent) by \(degrees)°")
+                print("[Importer] Rotating \(URL(fileURLWithPath: photoPath).lastPathComponent) by \(degrees)")
                 let sipsCommand = "/usr/bin/sips -r \(degrees) \(shellEscape(photoPath)) --out \(shellEscape(photoPath))"
                 _ = runShell(sipsCommand)
             }
         }
 
-        // 5. Convert videos from AVI to MP4
+        // 5. Convert videos from AVI to MP4 via FFmpegManager
+        FFmpegManager.ensureAvailable()
         var convertedVideos: [String] = []
         for aviPath in localVideos {
             let mp4Path = aviPath.replacingOccurrences(of: ".avi", with: ".mp4")
                 .replacingOccurrences(of: ".AVI", with: ".mp4")
             convertAVItoMP4(input: aviPath, output: mp4Path)
-            if FileManager.default.fileExists(atPath: mp4Path) {
+            if fm.fileExists(atPath: mp4Path) {
                 convertedVideos.append(mp4Path)
             }
         }
@@ -97,15 +104,14 @@ class Importer {
         let allImportPaths = localPhotos + convertedVideos
         PhotosImporter.importFiles(allImportPaths)
 
-        // 7. Upload to Vercel Blob (sequential — reliable)
+        // 7. Upload to GitHub repo
         let isoFormatter = ISO8601DateFormatter()
-        var uploadedItems: [[String: String]] = []
+        var uploadedCount = 0
 
-        // Build a map of original file hash by filename
+        // Build hash map by filename
         var hashByFilename: [String: String] = [:]
         for item in newFiles {
             hashByFilename[item.url.lastPathComponent] = item.hash
-            // Also map the .mp4 version for videos
             let mp4Name = item.url.lastPathComponent
                 .replacingOccurrences(of: ".avi", with: ".mp4")
                 .replacingOccurrences(of: ".AVI", with: ".mp4")
@@ -115,6 +121,8 @@ class Importer {
         let allUploads: [(path: String, type: String)] =
             localPhotos.map { ($0, "photo") } + convertedVideos.map { ($0, "video") }
 
+        var newEntries: [[String: String]] = []
+
         for item in allUploads {
             let fileURL = URL(fileURLWithPath: item.path)
             let filename = fileURL.lastPathComponent
@@ -123,30 +131,47 @@ class Importer {
             let created = (attrs?[.creationDate] as? Date) ?? Date()
             let timestamp = isoFormatter.string(from: created)
 
-            if let result = BlobUploader.upload(filePath: item.path, filename: filename) {
-                uploadedItems.append([
+            guard let fileData = fm.contents(atPath: item.path) else {
+                print("[Importer] Cannot read file: \(item.path)")
+                continue
+            }
+
+            // Upload to docs/media/{filename}
+            let repoPath = "docs/media/\(filename)"
+            do {
+                let existingSHA = api.getFileSHA(owner: username, repo: Config.repoName, path: repoPath)
+                _ = try api.uploadFile(
+                    owner: username,
+                    repo: Config.repoName,
+                    path: repoPath,
+                    content: fileData,
+                    message: "Add \(filename)",
+                    sha: existingSHA
+                )
+                uploadedCount += 1
+                print("[Importer] Uploaded \(filename)")
+
+                newEntries.append([
                     "type": item.type,
-                    "filename": result.filename,
-                    "url": result.url,
+                    "filename": filename,
+                    "url": "media/\(filename)",
                     "hash": hash,
                     "timestamp": timestamp,
                 ])
-                print("[Importer] Uploaded \(filename)")
-            } else {
-                print("[Importer] FAILED to upload \(filename)")
+            } catch {
+                print("[Importer] FAILED to upload \(filename): \(error.localizedDescription)")
             }
         }
 
-        // 8. POST metadata to API
-        if !uploadedItems.isEmpty {
-            postMetadata(items: uploadedItems)
+        // 8. Update docs/data.json — download existing, append new entries, upload
+        if !newEntries.isEmpty {
+            updateDataJSON(api: api, owner: username, newEntries: newEntries)
         }
 
-        // 9. Save hashes + delete from camera ONLY if upload succeeded
-        if uploadedItems.count == allUploads.count {
+        // 9. Save hashes + delete from camera ONLY if all uploads succeeded
+        if uploadedCount == allUploads.count {
             saveImportedHashes(existing: importedHashes, new: allHashes)
 
-            // 10. Delete imported files from camera
             for item in newFiles {
                 do {
                     try fm.removeItem(at: item.url)
@@ -156,10 +181,49 @@ class Importer {
                 }
             }
         } else {
-            print("[Importer] Some uploads failed — keeping files on camera and not saving hashes")
+            print("[Importer] Some uploads failed - keeping files on camera and not saving hashes")
         }
 
         return ImportCounts(photos: localPhotos.count, videos: convertedVideos.count)
+    }
+
+    // MARK: - data.json Management
+
+    private func updateDataJSON(api: GitHubAPI, owner: String, newEntries: [[String: String]]) {
+        let dataPath = "docs/data.json"
+
+        // Download existing data.json
+        var existingEntries: [[String: String]] = []
+        let existingSHA = api.getFileSHA(owner: owner, repo: Config.repoName, path: dataPath)
+
+        if let data = api.downloadFile(owner: owner, repo: Config.repoName, path: dataPath) {
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [[String: String]] {
+                existingEntries = json
+            }
+        }
+
+        // Append new entries
+        let allEntries = existingEntries + newEntries
+
+        // Upload updated data.json
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: allEntries, options: [.prettyPrinted, .sortedKeys]) else {
+            print("[Importer] Failed to serialize data.json")
+            return
+        }
+
+        do {
+            _ = try api.uploadFile(
+                owner: owner,
+                repo: Config.repoName,
+                path: dataPath,
+                content: jsonData,
+                message: "Update gallery data",
+                sha: existingSHA
+            )
+            print("[Importer] Updated data.json with \(newEntries.count) new entries")
+        } catch {
+            print("[Importer] Failed to update data.json: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - File Discovery
@@ -203,37 +267,9 @@ class Importer {
 
     private func convertAVItoMP4(input: String, output: String) {
         print("[Importer] Converting \(input) to MP4")
-        let command = "/opt/homebrew/bin/ffmpeg -i \(shellEscape(input)) -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart -y \(shellEscape(output)) 2>/dev/null"
+        let ffmpeg = FFmpegManager.resolvedPath
+        let command = "\(shellEscape(ffmpeg)) -i \(shellEscape(input)) -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart -y \(shellEscape(output))"
         _ = runShell(command)
-    }
-
-    // MARK: - Metadata POST
-
-    private func postMetadata(items: [[String: String]]) {
-        guard let url = URL(string: Config.importAPIURL) else { return }
-
-        let body: [String: Any] = ["items": items]
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: body) else { return }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(Config.importSecret)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = jsonData
-
-        let semaphore = DispatchSemaphore(value: 0)
-        let task = URLSession.shared.dataTask(with: request) { data, response, error in
-            defer { semaphore.signal() }
-            if let error = error {
-                print("[Importer] API POST error: \(error.localizedDescription)")
-                return
-            }
-            if let httpResponse = response as? HTTPURLResponse {
-                print("[Importer] API POST status: \(httpResponse.statusCode)")
-            }
-        }
-        task.resume()
-        semaphore.wait()
     }
 
     // MARK: - Shell Helpers
@@ -261,5 +297,18 @@ class Importer {
 
     private func shellEscape(_ path: String) -> String {
         return "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+}
+
+// MARK: - Import Errors
+
+enum ImportError: Error, LocalizedError {
+    case notAuthenticated
+
+    var errorDescription: String? {
+        switch self {
+        case .notAuthenticated:
+            return "Not signed in to GitHub. Open Charmera preferences to sign in."
+        }
     }
 }
