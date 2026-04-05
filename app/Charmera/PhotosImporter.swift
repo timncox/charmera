@@ -1,6 +1,22 @@
 import Foundation
+import Photos
 
 enum PhotosImporter {
+
+    static func requestAccessIfNeeded(completion: @escaping (Bool) -> Void) {
+        let status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+        switch status {
+        case .authorized, .limited:
+            completion(true)
+        case .notDetermined:
+            PHPhotoLibrary.requestAuthorization(for: .addOnly) { newStatus in
+                completion(newStatus == .authorized || newStatus == .limited)
+            }
+        default:
+            completion(false)
+        }
+    }
+
     static func importFiles(_ paths: [String]) {
         guard !paths.isEmpty else { return }
 

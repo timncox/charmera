@@ -4,20 +4,27 @@ import CryptoKit
 struct ImportCounts {
     let photos: Int
     let videos: Int
+    let reviewOnly: Bool
+
+    init(photos: Int, videos: Int, reviewOnly: Bool = false) {
+        self.photos = photos
+        self.videos = videos
+        self.reviewOnly = reviewOnly
+    }
 }
 
 class Importer {
 
-    func run() -> Result<ImportCounts, Error> {
+    func run(reviewOnly: Bool = false) -> Result<ImportCounts, Error> {
         do {
-            let counts = try performImport()
+            let counts = try performImport(reviewOnly: reviewOnly)
             return .success(counts)
         } catch {
             return .failure(error)
         }
     }
 
-    private func performImport() throws -> ImportCounts {
+    private func performImport(reviewOnly: Bool = false) throws -> ImportCounts {
         let fm = FileManager.default
         try fm.createDirectory(atPath: Config.localBackupRoot, withIntermediateDirectories: true)
 
@@ -29,7 +36,10 @@ class Importer {
         let api = GitHubAPI(token: token)
 
         // 1. Discover files
-        let dcimURL = URL(fileURLWithPath: Config.cameraVolumePath)
+        guard let cameraPath = Config.cameraVolumePath else {
+            throw ImportError.noCameraFound
+        }
+        let dcimURL = URL(fileURLWithPath: cameraPath)
         let allFiles = try discoverFiles(in: dcimURL)
         print("[Importer] Found \(allFiles.count) files on camera")
 
@@ -100,11 +110,38 @@ class Importer {
             }
         }
 
+        // If review-only mode, stop here — user will review, rotate, delete, then upload from Review window
+        if reviewOnly {
+            // Still save hashes so they don't re-import
+            saveImportedHashes(existing: importedHashes, new: allHashes)
+
+            let deleteFromCamera = UserDefaults.standard.object(forKey: "deleteFromCamera") as? Bool ?? true
+            if deleteFromCamera {
+                for item in newFiles {
+                    try? fm.removeItem(at: item.url)
+                }
+            }
+
+            return ImportCounts(photos: localPhotos.count, videos: convertedVideos.count, reviewOnly: true)
+        }
+
         // 6. Import to Photos.app (if enabled)
         let importToPhotos = UserDefaults.standard.object(forKey: "importToPhotos") as? Bool ?? true
         if importToPhotos {
-            let allImportPaths = localPhotos + convertedVideos
-            PhotosImporter.importFiles(allImportPaths)
+            let semaphore = DispatchSemaphore(value: 0)
+            var hasAccess = false
+            PhotosImporter.requestAccessIfNeeded { granted in
+                hasAccess = granted
+                semaphore.signal()
+            }
+            semaphore.wait()
+
+            if hasAccess {
+                let allImportPaths = localPhotos + convertedVideos
+                PhotosImporter.importFiles(allImportPaths)
+            } else {
+                print("[Importer] Photos access denied — skipping Photos.app import")
+            }
         }
 
         // 7. Upload to GitHub repo
@@ -175,12 +212,15 @@ class Importer {
         if uploadedCount == allUploads.count {
             saveImportedHashes(existing: importedHashes, new: allHashes)
 
-            for item in newFiles {
-                do {
-                    try fm.removeItem(at: item.url)
-                    print("[Importer] Deleted \(item.url.lastPathComponent) from camera")
-                } catch {
-                    print("[Importer] Could not delete \(item.url.lastPathComponent): \(error)")
+            let deleteFromCamera = UserDefaults.standard.object(forKey: "deleteFromCamera") as? Bool ?? true
+            if deleteFromCamera {
+                for item in newFiles {
+                    do {
+                        try fm.removeItem(at: item.url)
+                        print("[Importer] Deleted \(item.url.lastPathComponent) from camera")
+                    } catch {
+                        print("[Importer] Could not delete \(item.url.lastPathComponent): \(error)")
+                    }
                 }
             }
         } else {
@@ -307,11 +347,14 @@ class Importer {
 
 enum ImportError: Error, LocalizedError {
     case notAuthenticated
+    case noCameraFound
 
     var errorDescription: String? {
         switch self {
         case .notAuthenticated:
             return "Not signed in to GitHub. Open Charmera preferences to sign in."
+        case .noCameraFound:
+            return "No Charmera camera found."
         }
     }
 }

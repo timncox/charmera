@@ -42,6 +42,16 @@ if [ -d "$TEMPLATE_SRC" ]; then
     echo "Bundled gallery template."
 fi
 
+# Code sign (use Developer ID if available, otherwise ad-hoc)
+IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | head -1 | awk -F'"' '{print $2}' || true)
+if [ -n "${IDENTITY:-}" ]; then
+    echo "Signing with: $IDENTITY"
+    codesign --force --deep --sign "$IDENTITY" "$BUNDLE_DIR"
+else
+    echo "Ad-hoc signing..."
+    codesign --force --deep --sign - "$BUNDLE_DIR"
+fi
+
 echo "Built: $BUNDLE_DIR"
 echo ""
 echo "To run:  open $BUNDLE_DIR"

@@ -1,7 +1,22 @@
 import Foundation
 
 enum Config {
-    static let cameraVolumePath = "/Volumes/Charmera/DCIM"
+    static let cameraMarkerFolders = ["DCIM", "SPIDCIM"]
+
+    static var cameraVolumePath: String? {
+        let fm = FileManager.default
+        guard let volumes = try? fm.contentsOfDirectory(atPath: "/Volumes") else { return nil }
+        for volume in volumes {
+            let volumePath = "/Volumes/\(volume)"
+            let hasAll = cameraMarkerFolders.allSatisfy {
+                fm.fileExists(atPath: "\(volumePath)/\($0)")
+            }
+            if hasAll {
+                return "\(volumePath)/DCIM"
+            }
+        }
+        return nil
+    }
 
     static let localBackupRoot: String = {
         let home = FileManager.default.homeDirectoryForCurrentUser.path

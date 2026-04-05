@@ -7,6 +7,8 @@ import ServiceManagement
 struct PreferencesView: View {
     @State private var startAtLogin: Bool = LoginItemManager.isEnabled
     @State private var importToPhotos: Bool = UserDefaults.standard.object(forKey: "importToPhotos") as? Bool ?? true
+    @State private var deleteFromCamera: Bool = UserDefaults.standard.object(forKey: "deleteFromCamera") as? Bool ?? true
+    @State private var reviewBeforeUpload: Bool = UserDefaults.standard.object(forKey: "reviewBeforeUpload") as? Bool ?? false
     private let username = KeychainHelper.githubUsername ?? "unknown"
 
     private var galleryURL: String {
@@ -41,6 +43,18 @@ struct PreferencesView: View {
             Toggle("Also import to Photos.app", isOn: $importToPhotos)
                 .onChange(of: importToPhotos) { _, newValue in
                     UserDefaults.standard.set(newValue, forKey: "importToPhotos")
+                }
+
+            // Delete from camera after import
+            Toggle("Delete photos from camera after import", isOn: $deleteFromCamera)
+                .onChange(of: deleteFromCamera) { _, newValue in
+                    UserDefaults.standard.set(newValue, forKey: "deleteFromCamera")
+                }
+
+            // Review before upload
+            Toggle("Review photos before uploading", isOn: $reviewBeforeUpload)
+                .onChange(of: reviewBeforeUpload) { _, newValue in
+                    UserDefaults.standard.set(newValue, forKey: "reviewBeforeUpload")
                 }
 
             Divider()

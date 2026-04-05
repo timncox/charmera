@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #1a1511;
+    color: #f5f0e8;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  .header {
+    background: #ffb700;
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .header .k {
+    font-size: 28px;
+    font-weight: 900;
+    color: #e4002b;
+  }
+  .header .name {
+    font-size: 20px;
+    font-weight: 700;
+    color: #1a1511;
+  }
+  .rainbow {
+    display: flex;
+    height: 4px;
+  }
+  .rainbow div { flex: 1; }
+  .content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 30px;
+    text-align: center;
+  }
+  h2 { font-size: 22px; margin-bottom: 8px; }
+  p { color: rgba(245,240,232,0.6); margin-bottom: 24px; font-size: 14px; line-height: 1.5; }
+  .btn {
+    background: #ffb700;
+    color: #1a1511;
+    border: none;
+    padding: 12px 32px;
+    font-size: 15px;
+    font-weight: 700;
+    border-radius: 6px;
+    cursor: pointer;
+    letter-spacing: 0.03em;
+  }
+  .btn:hover { background: #e6a600; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <span class="k">K</span>
+    <span class="name">Charmera</span>
+  </div>
+  <div class="rainbow">
+    <div style="background:#e4002b"></div>
+    <div style="background:#e85d00"></div>
+    <div style="background:#f5a623"></div>
+    <div style="background:#ffb700"></div>
+    <div style="background:#7ab648"></div>
+    <div style="background:#00a3e0"></div>
+  </div>
+  <div class="content">
+    <h2>Welcome to Charmera</h2>
+    <p>Import photos from your Kodak Charmera camera and publish them to your own gallery hosted on GitHub Pages.</p>
+    <button class="btn" onclick="signIn()">Sign in with GitHub</button>
+  </div>
+  <script>
+    function signIn() {
+      const clientID = 'Ov23liHp3TaFjD42UIUc';
+      const redirect = 'charmera://callback';
+      const url = `https://github.com/login/oauth/authorize?client_id=${clientID}&redirect_uri=${encodeURIComponent(redirect)}&scope=repo`;
+      require('electron').shell.openExternal(url);
+      document.querySelector('.content').innerHTML = `
+        <div style="margin-bottom:16px">
+          <div style="width:40px;height:40px;border:3px solid rgba(255,183,0,0.3);border-top-color:#ffb700;border-radius:50%;animation:spin 1s linear infinite;margin:0 auto"></div>
+        </div>
+        <p>Waiting for authorization...<br>Complete the sign-in in your browser.</p>
+        <style>@keyframes spin { to { transform: rotate(360deg); } }</style>
+      `;
+    }
+  </script>
+</body>
+</html>

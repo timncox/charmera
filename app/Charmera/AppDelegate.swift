@@ -7,6 +7,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let setupController = SetupWindowController()
     private let prefsController = PreferencesWindowController()
+    private let reviewController = ReviewWindowController()
 
     // MARK: - App Lifecycle
 
@@ -63,7 +64,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Status Item
 
     private var isCameraConnected: Bool {
-        FileManager.default.fileExists(atPath: Config.cameraVolumePath)
+        Config.cameraVolumePath != nil
     }
 
     private func updateIcon() {
@@ -112,9 +113,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         isImporting = true
         updateIcon()
 
+        let reviewBeforeUpload = UserDefaults.standard.object(forKey: "reviewBeforeUpload") as? Bool ?? false
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let importer = Importer()
-            let result = importer.run()
+            let result = importer.run(reviewOnly: reviewBeforeUpload)
 
             DispatchQueue.main.async {
                 self?.isImporting = false
@@ -127,6 +130,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                             title: "Charmera",
                             body: "No new photos or videos found on camera."
                         )
+                    } else if counts.reviewOnly {
+                        self?.showNotification(
+                            title: "Charmera",
+                            body: "\(counts.photos) photo(s) ready for review."
+                        )
+                        self?.reviewController.show()
                     } else {
                         self?.showNotification(
                             title: "Charmera Import Complete",
@@ -166,6 +175,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         importItem.isEnabled = !isImporting && isCameraConnected
         menu.addItem(importItem)
 
+        let review = NSMenuItem(title: "Review Photos", action: #selector(showReview), keyEquivalent: "r")
+        review.target = self
+        menu.addItem(review)
+
         if isCameraConnected {
             let eject = NSMenuItem(title: "Eject Camera", action: #selector(ejectCamera), keyEquivalent: "e")
             eject.target = self
@@ -201,7 +214,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func ejectCamera() {
-        let volumePath = URL(fileURLWithPath: Config.cameraVolumePath).deletingLastPathComponent().deletingLastPathComponent()
+        guard let dcimPath = Config.cameraVolumePath else { return }
+        // cameraVolumePath returns e.g. "/Volumes/CHARMERA 1/DCIM", go up to volume root
+        let volumePath = URL(fileURLWithPath: dcimPath).deletingLastPathComponent()
         do {
             try NSWorkspace.shared.unmountAndEjectDevice(at: volumePath)
             showNotification(title: "Charmera", body: "Camera ejected safely.")
@@ -209,6 +224,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {
             showNotification(title: "Charmera", body: "Eject failed: \(error.localizedDescription)")
         }
+    }
+
+    @objc private func showReview() {
+        reviewController.show()
     }
 
     @objc private func showPreferences() {

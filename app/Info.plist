@@ -33,6 +33,10 @@
 			</array>
 		</dict>
 	</array>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Charmera imports your camera photos into a "Charmera" album in Photos.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Charmera uses AppleScript to import photos into the Photos app.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
