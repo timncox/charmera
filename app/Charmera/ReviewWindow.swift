@@ -331,7 +331,11 @@ struct ReviewView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(viewModel.isSaving || !viewModel.hasChanges)
 
-
+                Button("Upload to Gallery") {
+                    viewModel.uploadAll()
+                }
+                .buttonStyle(.bordered)
+                .disabled(viewModel.isSaving)
             }
             .padding(12)
 

@@ -17,8 +17,8 @@ brew install --cask charmera
 
 ### Download
 
-- **Mac:** [Download DMG](https://github.com/timncox/charmera/releases/latest)
-- **Windows:** [Download EXE](https://github.com/timncox/charmera/releases/latest)
+- **Mac:** [Download DMG](https://github.com/timncox/charmerapp/releases/latest)
+- **Windows:** [Download EXE](https://github.com/timncox/charmerapp/releases/latest)
 
 ## How it works
 
