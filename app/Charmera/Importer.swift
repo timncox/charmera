@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 
 struct ImportCounts {
     let photos: Int
@@ -46,15 +45,16 @@ class Importer {
         onStatus?("Found \(allFiles.count) files")
         print("[Importer] Found \(allFiles.count) files on camera")
 
-        // 2. Hash and filter already-imported
+        // 2. Filter already-imported by filename+size (fast — no camera reads)
         let importedHashes = loadImportedHashes()
         var newFiles: [(url: URL, hash: String)] = []
 
         for fileURL in allFiles {
-            let data = try Data(contentsOf: fileURL)
-            let hash = SHA256.hash(data: data).compactMap { String(format: "%02x", $0) }.joined()
-            if !importedHashes.contains(hash) {
-                newFiles.append((url: fileURL, hash: hash))
+            let attrs = try fm.attributesOfItem(atPath: fileURL.path)
+            let size = (attrs[.size] as? Int64) ?? (attrs[.size] as? Int).map(Int64.init) ?? 0
+            let key = "\(fileURL.lastPathComponent):\(size)"
+            if !importedHashes.contains(key) {
+                newFiles.append((url: fileURL, hash: key))
             }
         }
 
@@ -316,12 +316,43 @@ class Importer {
     // MARK: - Hash Management
 
     private func loadImportedHashes() -> Set<String> {
-        guard let data = FileManager.default.contents(atPath: Config.hashFilePath),
-              let content = String(data: data, encoding: .utf8) else {
-            return []
+        var keys = Set<String>()
+
+        if let data = FileManager.default.contents(atPath: Config.hashFilePath),
+           let content = String(data: data, encoding: .utf8) {
+            keys.formUnion(content.components(separatedBy: .newlines).filter { !$0.isEmpty })
         }
-        let lines = content.components(separatedBy: .newlines).filter { !$0.isEmpty }
-        return Set(lines)
+
+        // Migration: seed filename:size keys from existing local backups so files
+        // imported under the old content-hash scheme don't re-import.
+        let fm = FileManager.default
+        if let dateDirs = try? fm.contentsOfDirectory(atPath: Config.localBackupRoot) {
+            for entry in dateDirs {
+                let dirPath = "\(Config.localBackupRoot)/\(entry)"
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: dirPath, isDirectory: &isDir), isDir.boolValue,
+                      let files = try? fm.contentsOfDirectory(atPath: dirPath) else { continue }
+                for file in files {
+                    let upper = file.uppercased()
+                    guard upper.hasSuffix(".AVI") || upper.hasSuffix(".JPG") else { continue }
+                    guard let attrs = try? fm.attributesOfItem(atPath: "\(dirPath)/\(file)") else { continue }
+                    let size = (attrs[.size] as? Int64) ?? (attrs[.size] as? Int).map(Int64.init) ?? 0
+                    keys.insert("\(stripCollisionSuffix(file)):\(size)")
+                }
+            }
+        }
+
+        return keys
+    }
+
+    private func stripCollisionSuffix(_ filename: String) -> String {
+        let ns = filename as NSString
+        let nameOnly = ns.deletingPathExtension
+        let ext = ns.pathExtension
+        let range = (nameOnly as NSString).range(of: "_\\d{9,11}$", options: .regularExpression)
+        guard range.location != NSNotFound else { return filename }
+        let stripped = (nameOnly as NSString).substring(to: range.location)
+        return ext.isEmpty ? stripped : "\(stripped).\(ext)"
     }
 
     private func saveImportedHashes(existing: Set<String>, new: [String]) {
@@ -336,7 +367,7 @@ class Importer {
     private func convertAVItoMP4(input: String, output: String) {
         print("[Importer] Converting \(input) to MP4")
         let ffmpeg = FFmpegManager.resolvedPath
-        let command = "\(shellEscape(ffmpeg)) -i \(shellEscape(input)) -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k -movflags +faststart -y \(shellEscape(output))"
+        let command = "\(shellEscape(ffmpeg)) -i \(shellEscape(input)) -c:v h264_videotoolbox -b:v 2M -c:a aac -b:a 128k -movflags +faststart -y \(shellEscape(output))"
         _ = runShell(command)
     }
 
