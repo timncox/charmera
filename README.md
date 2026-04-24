@@ -31,11 +31,11 @@ On first launch, sign in with GitHub. Charmera creates a repo and enables GitHub
 ## Features
 
 - **Menu bar / system tray** — gray (idle), gold (camera connected), blue (importing)
-- **Auto orientation** — Apple Vision (Mac) / sharp (Windows) detects and fixes rotation
-- **Video conversion** — AVI to MP4 via ffmpeg
+- **Auto orientation** — Apple Vision face landmarks (Mac) / sharp (Windows) for precise rotation, with horizon fallback
+- **Video conversion** — AVI to MP4 via hardware-accelerated `h264_videotoolbox` (bundled ffmpeg)
 - **Review Photos** — rotate and delete photos before or after uploading to gallery
 - **Photos.app import** — optional, configurable in Preferences (Mac)
-- **Duplicate detection** — SHA-256 hashing prevents re-imports
+- **Duplicate detection** — filename+size dedup; scan is instant
 - **Camera cleanup** — optional, toggle "Delete photos from camera after import" in Preferences
 - **Eject from menu** — right-click to safely eject camera
 - **Review before upload** — optional, review/rotate/delete photos before they go to the gallery
