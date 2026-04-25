@@ -199,30 +199,46 @@ class Importer {
                 continue
             }
 
-            // Upload to docs/media/{filename}
-            let repoPath = "docs/media/\(filename)"
+            // Never overwrite an existing remote file: when the camera is reformatted, numbering
+            // resets to PICT0000 and would silently clobber unrelated earlier photos. Rename to a
+            // date-suffixed variant on collision instead.
+            var uploadFilename = filename
+            var repoPath = "docs/media/\(uploadFilename)"
+            if api.getFileSHA(owner: username, repo: Config.repoName, path: repoPath) != nil {
+                let nameOnly = (filename as NSString).deletingPathExtension
+                let ext = (filename as NSString).pathExtension
+                var counter = 1
+                while true {
+                    let suffix = counter == 1 ? dateFolderName : "\(dateFolderName)_\(counter)"
+                    uploadFilename = ext.isEmpty ? "\(nameOnly)_\(suffix)" : "\(nameOnly)_\(suffix).\(ext)"
+                    repoPath = "docs/media/\(uploadFilename)"
+                    if api.getFileSHA(owner: username, repo: Config.repoName, path: repoPath) == nil { break }
+                    counter += 1
+                }
+                print("[Importer] \(filename) collides remotely — uploading as \(uploadFilename)")
+            }
+
             do {
-                let existingSHA = api.getFileSHA(owner: username, repo: Config.repoName, path: repoPath)
                 _ = try api.uploadFile(
                     owner: username,
                     repo: Config.repoName,
                     path: repoPath,
                     content: fileData,
-                    message: "Add \(filename)",
-                    sha: existingSHA
+                    message: "Add \(uploadFilename)",
+                    sha: nil
                 )
                 uploadedCount += 1
-                print("[Importer] Uploaded \(filename)")
+                print("[Importer] Uploaded \(uploadFilename)")
 
                 newEntries.append([
                     "type": item.type,
-                    "filename": filename,
-                    "url": "media/\(filename)",
+                    "filename": uploadFilename,
+                    "url": "media/\(uploadFilename)",
                     "hash": hash,
                     "timestamp": timestamp,
                 ])
             } catch {
-                print("[Importer] FAILED to upload \(filename): \(error.localizedDescription)")
+                print("[Importer] FAILED to upload \(uploadFilename): \(error.localizedDescription)")
             }
         }
 
