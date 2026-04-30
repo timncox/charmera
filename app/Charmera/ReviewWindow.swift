@@ -85,19 +85,49 @@ class ReviewViewModel: ObservableObject {
         photos.contains { $0.rotation != 0 || $0.markedForDeletion }
     }
 
-    /// Find the actual repo path for a photo — could be flat or in a date subfolder
-    private func resolveRepoPath(api: GitHubAPI, owner: String, photo: ReviewPhoto) -> (path: String, sha: String)? {
-        // Try flat path first (how the Importer uploads)
+    /// Find the actual repo path for a photo. The local backup keeps the camera's
+    /// original filename (e.g. PICT0009.jpg), but on remote-name collision the importer
+    /// renames the upload (e.g. PICT0009_2026-04-30.jpg) and only records the mapping in
+    /// data.json's `hash` field (`<originalName>:<size>`). Look up there first so we
+    /// always target the correct gallery file — using the local filename blindly would
+    /// hit an unrelated older entry and corrupt it.
+    private func resolveRepoPath(api: GitHubAPI, owner: String, photo: ReviewPhoto, dataMap: [String: String]) -> (path: String, sha: String)? {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: photo.filePath)
+        let size = (attrs?[.size] as? Int64) ?? (attrs?[.size] as? Int).map(Int64.init) ?? 0
+        let key = "\(photo.filename):\(size)"
+        if let mapped = dataMap[key] {
+            let mappedPath = "docs/media/\(mapped)"
+            if let sha = api.getFileSHA(owner: owner, repo: Config.repoName, path: mappedPath) {
+                return (mappedPath, sha)
+            }
+        }
+        // Fall back to filename-based lookup for older uploads that predate the hash field.
         let flatPath = "docs/media/\(photo.filename)"
         if let sha = api.getFileSHA(owner: owner, repo: Config.repoName, path: flatPath) {
             return (flatPath, sha)
         }
-        // Try date subfolder (how manual uploads organized them)
         let datePath = "docs/media/\(photo.dateFolder)/\(photo.filename)"
         if let sha = api.getFileSHA(owner: owner, repo: Config.repoName, path: datePath) {
             return (datePath, sha)
         }
         return nil
+    }
+
+    /// Build a lookup from `<cameraFilename>:<size>` (the importer's hash field) to the
+    /// gallery filename it was uploaded as. Empty if data.json is unreachable; callers
+    /// should still fall back to filename-based resolution in that case.
+    private func loadDataJSONMap(api: GitHubAPI, owner: String) -> [String: String] {
+        guard let data = api.downloadFile(owner: owner, repo: Config.repoName, path: "docs/data.json"),
+              let entries = (try? JSONSerialization.jsonObject(with: data)) as? [[String: String]] else {
+            return [:]
+        }
+        var map: [String: String] = [:]
+        for e in entries {
+            if let h = e["hash"], let f = e["filename"] {
+                map[h] = f
+            }
+        }
+        return map
     }
 
     func applyChanges() {
@@ -143,12 +173,16 @@ class ReviewViewModel: ObservableObject {
             if let token = KeychainHelper.githubToken,
                let username = KeychainHelper.githubUsername {
                 let api = GitHubAPI(token: token)
+                let dataMap = self?.loadDataJSONMap(api: api, owner: username) ?? [:]
 
-                // Resolve every affected file's actual repo path (some are in date subfolders).
+                // Resolve every affected file's actual repo path. data.json's `hash` field
+                // (set during import) maps camera-filename:size to the gallery filename — so
+                // collisions like local PICT0009.jpg → gallery PICT0009_2026-04-30.jpg are
+                // resolved correctly here instead of clobbering an unrelated older entry.
                 var addFiles: [(path: String, content: Data)] = []
                 for photo in rotatedSucceeded {
                     guard let fileData = FileManager.default.contents(atPath: photo.filePath),
-                          let resolved = self?.resolveRepoPath(api: api, owner: username, photo: photo) else {
+                          let resolved = self?.resolveRepoPath(api: api, owner: username, photo: photo, dataMap: dataMap) else {
                         sipsErrors.append("\(photo.filename) (could not resolve remote path)")
                         continue
                     }
@@ -158,7 +192,7 @@ class ReviewViewModel: ObservableObject {
                 var deletePaths: [String] = []
                 var resolvedDeletions: [(photo: ReviewPhoto, path: String)] = []
                 for photo in deleted {
-                    if let resolved = self?.resolveRepoPath(api: api, owner: username, photo: photo) {
+                    if let resolved = self?.resolveRepoPath(api: api, owner: username, photo: photo, dataMap: dataMap) {
                         deletePaths.append(resolved.path)
                         resolvedDeletions.append((photo: photo, path: resolved.path))
                     } else {
