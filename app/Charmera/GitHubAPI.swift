@@ -52,6 +52,87 @@ struct GitHubAPI {
         return newSHA
     }
 
+    /// Uploads multiple files as a single commit using the Git Data API.
+    /// One commit means one Pages build, instead of N rapid-fire builds that overwhelm the legacy
+    /// builder and cause cascading "Page build failed" errors.
+    @discardableResult
+    func uploadFilesAsOneCommit(
+        owner: String,
+        repo: String,
+        branch: String,
+        files: [(path: String, content: Data)],
+        message: String
+    ) throws -> String {
+        guard !files.isEmpty else {
+            throw GitHubError.unexpectedResponse("uploadFilesAsOneCommit called with no files")
+        }
+
+        // 1. Resolve current branch tip and its tree.
+        let refData = try request(method: "GET", path: "/repos/\(owner)/\(repo)/git/ref/heads/\(branch)")
+        guard let refJSON = try JSONSerialization.jsonObject(with: refData) as? [String: Any],
+              let refObj = refJSON["object"] as? [String: Any],
+              let parentSHA = refObj["sha"] as? String else {
+            throw GitHubError.unexpectedResponse("Could not parse ref for \(branch)")
+        }
+
+        let commitData = try request(method: "GET", path: "/repos/\(owner)/\(repo)/git/commits/\(parentSHA)")
+        guard let commitJSON = try JSONSerialization.jsonObject(with: commitData) as? [String: Any],
+              let treeObj = commitJSON["tree"] as? [String: Any],
+              let baseTreeSHA = treeObj["sha"] as? String else {
+            throw GitHubError.unexpectedResponse("Could not parse base tree from commit \(parentSHA)")
+        }
+
+        // 2. Create a blob for each file.
+        var treeEntries: [[String: Any]] = []
+        treeEntries.reserveCapacity(files.count)
+        for file in files {
+            let blobBody: [String: Any] = [
+                "content": file.content.base64EncodedString(),
+                "encoding": "base64",
+            ]
+            let blobData = try request(method: "POST", path: "/repos/\(owner)/\(repo)/git/blobs", body: blobBody, allowedStatuses: [201])
+            guard let blobJSON = try JSONSerialization.jsonObject(with: blobData) as? [String: Any],
+                  let blobSHA = blobJSON["sha"] as? String else {
+                throw GitHubError.unexpectedResponse("Could not parse blob SHA for \(file.path)")
+            }
+            treeEntries.append([
+                "path": file.path,
+                "mode": "100644",
+                "type": "blob",
+                "sha": blobSHA,
+            ])
+        }
+
+        // 3. Build a new tree on top of the base tree.
+        let treeBody: [String: Any] = [
+            "base_tree": baseTreeSHA,
+            "tree": treeEntries,
+        ]
+        let newTreeData = try request(method: "POST", path: "/repos/\(owner)/\(repo)/git/trees", body: treeBody, allowedStatuses: [201])
+        guard let newTreeJSON = try JSONSerialization.jsonObject(with: newTreeData) as? [String: Any],
+              let newTreeSHA = newTreeJSON["sha"] as? String else {
+            throw GitHubError.unexpectedResponse("Could not parse new tree SHA")
+        }
+
+        // 4. Create the commit referencing that tree.
+        let commitBody: [String: Any] = [
+            "message": message,
+            "tree": newTreeSHA,
+            "parents": [parentSHA],
+        ]
+        let newCommitData = try request(method: "POST", path: "/repos/\(owner)/\(repo)/git/commits", body: commitBody, allowedStatuses: [201])
+        guard let newCommitJSON = try JSONSerialization.jsonObject(with: newCommitData) as? [String: Any],
+              let newCommitSHA = newCommitJSON["sha"] as? String else {
+            throw GitHubError.unexpectedResponse("Could not parse new commit SHA")
+        }
+
+        // 5. Fast-forward the branch to the new commit.
+        let updateRefBody: [String: Any] = ["sha": newCommitSHA, "force": false]
+        _ = try request(method: "PATCH", path: "/repos/\(owner)/\(repo)/git/refs/heads/\(branch)", body: updateRefBody, allowedStatuses: [200])
+
+        return newCommitSHA
+    }
+
     func deleteFile(owner: String, repo: String, path: String, sha: String, message: String) throws {
         let body: [String: Any] = [
             "message": message,

@@ -160,17 +160,22 @@ class Importer {
 
             if hasAccess {
                 let allImportPaths = localPhotos + convertedVideos
-                PhotosImporter.importFiles(allImportPaths)
+                onStatus?("Adding to Photos.app…")
+                let imported = PhotosImporter.importFiles(allImportPaths)
+                if imported < allImportPaths.count {
+                    print("[Importer] Photos.app import partial: \(imported)/\(allImportPaths.count)")
+                }
             } else {
                 print("[Importer] Photos access denied — skipping Photos.app import")
             }
         }
 
-        // 7. Upload to GitHub repo
+        // 7. Upload everything in a single commit via the Git Data API.
+        // The old loop fired one Contents-API call per file, which created N commits in seconds and
+        // overwhelmed the GitHub Pages legacy builder (cascading "Page build failed"). One commit
+        // here means one Pages build.
         let isoFormatter = ISO8601DateFormatter()
-        var uploadedCount = 0
 
-        // Build hash map by filename
         var hashByFilename: [String: String] = [:]
         for item in newFiles {
             hashByFilename[item.url.lastPathComponent] = item.hash
@@ -183,10 +188,16 @@ class Importer {
         let allUploads: [(path: String, type: String)] =
             localPhotos.map { ($0, "photo") } + convertedVideos.map { ($0, "video") }
 
+        // Fetch the remote media listing once to detect filename collisions, instead of one
+        // getFileSHA round-trip per file.
+        let existingRemoteNames = api.listDirectoryFilenames(owner: username, repo: Config.repoName, path: "docs/media") ?? Set<String>()
+        var plannedNames = Set<String>()
+
+        var filesToUpload: [(path: String, content: Data)] = []
         var newEntries: [[String: String]] = []
 
         for (index, item) in allUploads.enumerated() {
-            onStatus?("Uploading \(index + 1)/\(allUploads.count)")
+            onStatus?("Preparing \(index + 1)/\(allUploads.count)")
             let fileURL = URL(fileURLWithPath: item.path)
             let filename = fileURL.lastPathComponent
             let hash = hashByFilename[filename] ?? filename
@@ -201,53 +212,69 @@ class Importer {
 
             // Never overwrite an existing remote file: when the camera is reformatted, numbering
             // resets to PICT0000 and would silently clobber unrelated earlier photos. Rename to a
-            // date-suffixed variant on collision instead.
+            // date-suffixed variant on collision against either the remote tree or names already
+            // claimed earlier in this batch.
             var uploadFilename = filename
-            var repoPath = "docs/media/\(uploadFilename)"
-            if api.getFileSHA(owner: username, repo: Config.repoName, path: repoPath) != nil {
+            let isTaken: (String) -> Bool = { existingRemoteNames.contains($0) || plannedNames.contains($0) }
+            if isTaken(uploadFilename) {
                 let nameOnly = (filename as NSString).deletingPathExtension
                 let ext = (filename as NSString).pathExtension
                 var counter = 1
                 while true {
                     let suffix = counter == 1 ? dateFolderName : "\(dateFolderName)_\(counter)"
                     uploadFilename = ext.isEmpty ? "\(nameOnly)_\(suffix)" : "\(nameOnly)_\(suffix).\(ext)"
-                    repoPath = "docs/media/\(uploadFilename)"
-                    if api.getFileSHA(owner: username, repo: Config.repoName, path: repoPath) == nil { break }
+                    if !isTaken(uploadFilename) { break }
                     counter += 1
                 }
-                print("[Importer] \(filename) collides remotely — uploading as \(uploadFilename)")
+                print("[Importer] \(filename) collides — uploading as \(uploadFilename)")
             }
+            plannedNames.insert(uploadFilename)
 
+            filesToUpload.append((path: "docs/media/\(uploadFilename)", content: fileData))
+            newEntries.append([
+                "type": item.type,
+                "filename": uploadFilename,
+                "url": "media/\(uploadFilename)",
+                "hash": hash,
+                "timestamp": timestamp,
+            ])
+        }
+
+        // Fold the data.json update into the same commit.
+        var existingEntries: [[String: String]] = []
+        if let data = api.downloadFile(owner: username, repo: Config.repoName, path: "docs/data.json"),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [[String: String]] {
+            existingEntries = json
+        }
+        let existingURLs = Set(existingEntries.compactMap { $0["url"] })
+        let uniqueNew = newEntries.filter { !existingURLs.contains($0["url"] ?? "") }
+        let mergedEntries = existingEntries + uniqueNew
+        if let jsonData = try? JSONSerialization.data(withJSONObject: mergedEntries, options: [.prettyPrinted, .sortedKeys]) {
+            filesToUpload.append((path: "docs/data.json", content: jsonData))
+        }
+
+        let uploadedCount: Int
+        if filesToUpload.isEmpty {
+            uploadedCount = 0
+        } else {
+            onStatus?("Uploading \(allUploads.count) files…")
             do {
-                _ = try api.uploadFile(
+                _ = try api.uploadFilesAsOneCommit(
                     owner: username,
                     repo: Config.repoName,
-                    path: repoPath,
-                    content: fileData,
-                    message: "Add \(uploadFilename)",
-                    sha: nil
+                    branch: "main",
+                    files: filesToUpload,
+                    message: "Add \(allUploads.count) media (\(dateFolderName))"
                 )
-                uploadedCount += 1
-                print("[Importer] Uploaded \(uploadFilename)")
-
-                newEntries.append([
-                    "type": item.type,
-                    "filename": uploadFilename,
-                    "url": "media/\(uploadFilename)",
-                    "hash": hash,
-                    "timestamp": timestamp,
-                ])
+                uploadedCount = allUploads.count
+                print("[Importer] Uploaded \(allUploads.count) files + data.json in one commit")
             } catch {
-                print("[Importer] FAILED to upload \(uploadFilename): \(error.localizedDescription)")
+                print("[Importer] Batched upload failed: \(error.localizedDescription)")
+                uploadedCount = 0
             }
         }
 
-        // 8. Update docs/data.json — download existing, append new entries, upload
-        if !newEntries.isEmpty {
-            updateDataJSON(api: api, owner: username, newEntries: newEntries)
-        }
-
-        // 9. Save hashes + delete from camera ONLY if all uploads succeeded
+        // 8. Save hashes + delete from camera ONLY if all uploads succeeded
         if uploadedCount == allUploads.count {
             saveImportedHashes(existing: importedHashes, new: allHashes)
 
@@ -267,47 +294,6 @@ class Importer {
         }
 
         return ImportCounts(photos: localPhotos.count, videos: convertedVideos.count)
-    }
-
-    // MARK: - data.json Management
-
-    private func updateDataJSON(api: GitHubAPI, owner: String, newEntries: [[String: String]]) {
-        let dataPath = "docs/data.json"
-
-        // Download existing data.json
-        var existingEntries: [[String: String]] = []
-        let existingSHA = api.getFileSHA(owner: owner, repo: Config.repoName, path: dataPath)
-
-        if let data = api.downloadFile(owner: owner, repo: Config.repoName, path: dataPath) {
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [[String: String]] {
-                existingEntries = json
-            }
-        }
-
-        // Append new entries, avoiding duplicates by URL
-        let existingURLs = Set(existingEntries.compactMap { $0["url"] })
-        let uniqueNew = newEntries.filter { !existingURLs.contains($0["url"] ?? "") }
-        let allEntries = existingEntries + uniqueNew
-
-        // Upload updated data.json
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: allEntries, options: [.prettyPrinted, .sortedKeys]) else {
-            print("[Importer] Failed to serialize data.json")
-            return
-        }
-
-        do {
-            _ = try api.uploadFile(
-                owner: owner,
-                repo: Config.repoName,
-                path: dataPath,
-                content: jsonData,
-                message: "Update gallery data",
-                sha: existingSHA
-            )
-            print("[Importer] Updated data.json with \(newEntries.count) new entries")
-        } catch {
-            print("[Importer] Failed to update data.json: \(error.localizedDescription)")
-        }
     }
 
     // MARK: - File Discovery

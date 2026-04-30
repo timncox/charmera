@@ -258,63 +258,50 @@ class ReviewViewModel: ObservableObject {
                 semaphore.wait()
             }
 
+            // Build the batch — every photo + the updated data.json — and ship in one commit
+            // via the Git Data API. The old per-file Contents API loop fired N commits and tripped
+            // the GitHub Pages legacy builder.
+            var filesToUpload: [(path: String, content: Data)] = []
             for photo in photosToUpload {
                 guard let fileData = fm.contents(atPath: photo.filePath) else { continue }
-                let repoPath = "docs/media/\(photo.filename)"
-                let existingSHA = api.getFileSHA(owner: username, repo: Config.repoName, path: repoPath)
+                filesToUpload.append((path: "docs/media/\(photo.filename)", content: fileData))
 
-                do {
-                    _ = try api.uploadFile(
-                        owner: username,
-                        repo: Config.repoName,
-                        path: repoPath,
-                        content: fileData,
-                        message: "Add \(photo.filename)",
-                        sha: existingSHA
-                    )
-                    uploadCount += 1
-
-                    let ext = (photo.filename as NSString).pathExtension.lowercased()
-                    let mediaType = (ext == "mp4") ? "video" : "photo"
-                    let attrs = try? fm.attributesOfItem(atPath: photo.filePath)
-                    let created = (attrs?[.creationDate] as? Date) ?? Date()
-
-                    newEntries.append([
-                        "type": mediaType,
-                        "filename": photo.filename,
-                        "url": "media/\(photo.filename)",
-                        "timestamp": isoFormatter.string(from: created),
-                    ])
-                } catch {
-                    print("[Review] Failed to upload \(photo.filename): \(error)")
-                }
+                let ext = (photo.filename as NSString).pathExtension.lowercased()
+                let mediaType = (ext == "mp4") ? "video" : "photo"
+                let attrs = try? fm.attributesOfItem(atPath: photo.filePath)
+                let created = (attrs?[.creationDate] as? Date) ?? Date()
+                newEntries.append([
+                    "type": mediaType,
+                    "filename": photo.filename,
+                    "url": "media/\(photo.filename)",
+                    "timestamp": isoFormatter.string(from: created),
+                ])
             }
 
-            // Update data.json
-            if !newEntries.isEmpty {
-                let dataPath = "docs/data.json"
+            if !filesToUpload.isEmpty {
                 var existingEntries: [[String: String]] = []
-                let dataSHA = api.getFileSHA(owner: username, repo: Config.repoName, path: dataPath)
-
-                if let data = api.downloadFile(owner: username, repo: Config.repoName, path: dataPath),
+                if let data = api.downloadFile(owner: username, repo: Config.repoName, path: "docs/data.json"),
                    let json = try? JSONSerialization.jsonObject(with: data) as? [[String: String]] {
                     existingEntries = json
                 }
-
-                // Merge — avoid duplicates by url
                 let existingURLs = Set(existingEntries.compactMap { $0["url"] })
                 let uniqueNew = newEntries.filter { !existingURLs.contains($0["url"] ?? "") }
-                let allEntries = existingEntries + uniqueNew
+                let mergedEntries = existingEntries + uniqueNew
+                if let jsonData = try? JSONSerialization.data(withJSONObject: mergedEntries, options: [.prettyPrinted, .sortedKeys]) {
+                    filesToUpload.append((path: "docs/data.json", content: jsonData))
+                }
 
-                if let jsonData = try? JSONSerialization.data(withJSONObject: allEntries, options: [.prettyPrinted, .sortedKeys]) {
-                    _ = try? api.uploadFile(
+                do {
+                    _ = try api.uploadFilesAsOneCommit(
                         owner: username,
                         repo: Config.repoName,
-                        path: dataPath,
-                        content: jsonData,
-                        message: "Update gallery data",
-                        sha: dataSHA
+                        branch: "main",
+                        files: filesToUpload,
+                        message: "Add \(newEntries.count) media (review)"
                     )
+                    uploadCount = newEntries.count
+                } catch {
+                    print("[Review] Batched upload failed: \(error.localizedDescription)")
                 }
             }
 
