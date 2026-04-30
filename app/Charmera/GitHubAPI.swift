@@ -61,10 +61,11 @@ struct GitHubAPI {
         repo: String,
         branch: String,
         files: [(path: String, content: Data)],
+        deletions: [String] = [],
         message: String
     ) throws -> String {
-        guard !files.isEmpty else {
-            throw GitHubError.unexpectedResponse("uploadFilesAsOneCommit called with no files")
+        guard !files.isEmpty || !deletions.isEmpty else {
+            throw GitHubError.unexpectedResponse("uploadFilesAsOneCommit called with no changes")
         }
 
         // 1. Resolve current branch tip and its tree.
@@ -103,7 +104,18 @@ struct GitHubAPI {
             ])
         }
 
-        // 3. Build a new tree on top of the base tree.
+        // 3. Append deletion entries: a tree entry with `sha: null` removes the path
+        // from the new tree (relative to base_tree).
+        for path in deletions {
+            treeEntries.append([
+                "path": path,
+                "mode": "100644",
+                "type": "blob",
+                "sha": NSNull(),
+            ])
+        }
+
+        // 4. Build a new tree on top of the base tree.
         let treeBody: [String: Any] = [
             "base_tree": baseTreeSHA,
             "tree": treeEntries,
@@ -114,7 +126,7 @@ struct GitHubAPI {
             throw GitHubError.unexpectedResponse("Could not parse new tree SHA")
         }
 
-        // 4. Create the commit referencing that tree.
+        // 5. Create the commit referencing that tree.
         let commitBody: [String: Any] = [
             "message": message,
             "tree": newTreeSHA,
@@ -126,7 +138,7 @@ struct GitHubAPI {
             throw GitHubError.unexpectedResponse("Could not parse new commit SHA")
         }
 
-        // 5. Fast-forward the branch to the new commit.
+        // 6. Fast-forward the branch to the new commit.
         let updateRefBody: [String: Any] = ["sha": newCommitSHA, "force": false]
         _ = try request(method: "PATCH", path: "/repos/\(owner)/\(repo)/git/refs/heads/\(branch)", body: updateRefBody, allowedStatuses: [200])
 

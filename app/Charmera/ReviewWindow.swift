@@ -100,50 +100,6 @@ class ReviewViewModel: ObservableObject {
         return nil
     }
 
-    /// Re-fetch the docs/media directory and drop any data.json entries whose
-    /// referenced file no longer exists. Self-healing — covers per-session deletes
-    /// and any orphans left over from prior failed cleanups.
-    private func reconcileDataJSON(api: GitHubAPI, owner: String) {
-        let dataPath = "docs/data.json"
-        guard let mediaFiles = api.listDirectoryFilenames(owner: owner, repo: Config.repoName, path: "docs/media") else {
-            print("[Review] Reconcile skipped: failed to list docs/media")
-            return
-        }
-        guard let dataSHA = api.getFileSHA(owner: owner, repo: Config.repoName, path: dataPath),
-              let data = api.downloadFile(owner: owner, repo: Config.repoName, path: dataPath),
-              let entries = (try? JSONSerialization.jsonObject(with: data)) as? [[String: String]] else {
-            print("[Review] Reconcile skipped: could not load data.json")
-            return
-        }
-        let filtered = entries.filter { entry in
-            guard let url = entry["url"] else { return false }
-            let basename = (url as NSString).lastPathComponent
-            return mediaFiles.contains(basename)
-        }
-        if filtered.count == entries.count {
-            print("[Review] Reconcile: data.json already in sync (\(entries.count) entries)")
-            return
-        }
-        let removed = entries.count - filtered.count
-        guard let jsonData = try? JSONSerialization.data(withJSONObject: filtered, options: [.prettyPrinted, .sortedKeys]) else {
-            print("[Review] Reconcile failed: could not serialize data.json")
-            return
-        }
-        do {
-            _ = try api.uploadFile(
-                owner: owner,
-                repo: Config.repoName,
-                path: dataPath,
-                content: jsonData,
-                message: "Remove deleted photos from gallery",
-                sha: dataSHA
-            )
-            print("[Review] Reconcile: removed \(removed) orphan entries from data.json")
-        } catch {
-            print("[Review] Reconcile failed: data.json upload error: \(error.localizedDescription)")
-        }
-    }
-
     func applyChanges() {
         isSaving = true
         let rotated = photos.filter { $0.rotation != 0 && !$0.markedForDeletion }
@@ -156,71 +112,116 @@ class ReviewViewModel: ObservableObject {
         }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            var count = 0
+            // Step 1: rotate locally with sips. Failures are real — surface them.
+            var sipsErrors: [String] = []
+            var rotatedSucceeded: [ReviewPhoto] = []
             for photo in rotated {
-                let command = "/usr/bin/sips -r \(photo.rotation) '\(photo.filePath)' --out '\(photo.filePath)'"
                 let proc = Process()
                 proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
-                proc.arguments = ["-c", command]
+                proc.arguments = ["-c", "/usr/bin/sips -r \(photo.rotation) '\(photo.filePath)' --out '\(photo.filePath)'"]
                 proc.standardOutput = FileHandle.nullDevice
                 proc.standardError = FileHandle.nullDevice
-                try? proc.run()
-                proc.waitUntilExit()
-
-                // Re-upload to GitHub
-                if let token = KeychainHelper.githubToken,
-                   let username = KeychainHelper.githubUsername {
-                    let api = GitHubAPI(token: token)
-                    if let fileData = FileManager.default.contents(atPath: photo.filePath),
-                       let resolved = self?.resolveRepoPath(api: api, owner: username, photo: photo) {
-                        _ = try? api.uploadFile(
-                            owner: username,
-                            repo: Config.repoName,
-                            path: resolved.path,
-                            content: fileData,
-                            message: "Rotate \(photo.filename)",
-                            sha: resolved.sha
-                        )
+                do {
+                    try proc.run()
+                    proc.waitUntilExit()
+                    if proc.terminationStatus == 0 {
+                        rotatedSucceeded.append(photo)
+                    } else {
+                        sipsErrors.append("\(photo.filename) (sips exit \(proc.terminationStatus))")
                     }
+                } catch {
+                    sipsErrors.append("\(photo.filename) (\(error.localizedDescription))")
                 }
-                count += 1
             }
 
-            // Delete marked photos from GitHub
+            // Step 2: build one batched commit — rotated photos as adds, deleted photos as deletions,
+            // and data.json reconciled to the post-state — instead of N separate commits that
+            // overwhelm the Pages legacy builder.
+            var uploadError: String?
             var deleteCount = 0
+            var rotateCount = 0
             if let token = KeychainHelper.githubToken,
                let username = KeychainHelper.githubUsername {
                 let api = GitHubAPI(token: token)
+
+                // Resolve every affected file's actual repo path (some are in date subfolders).
+                var addFiles: [(path: String, content: Data)] = []
+                for photo in rotatedSucceeded {
+                    guard let fileData = FileManager.default.contents(atPath: photo.filePath),
+                          let resolved = self?.resolveRepoPath(api: api, owner: username, photo: photo) else {
+                        sipsErrors.append("\(photo.filename) (could not resolve remote path)")
+                        continue
+                    }
+                    addFiles.append((path: resolved.path, content: fileData))
+                }
+
+                var deletePaths: [String] = []
+                var resolvedDeletions: [(photo: ReviewPhoto, path: String)] = []
                 for photo in deleted {
                     if let resolved = self?.resolveRepoPath(api: api, owner: username, photo: photo) {
-                        do {
-                            try api.deleteFile(owner: username, repo: Config.repoName, path: resolved.path, sha: resolved.sha, message: "Delete \(photo.filename)")
-                            try? FileManager.default.removeItem(atPath: photo.filePath)
-                            deleteCount += 1
-                        } catch {
-                            print("[Review] Failed to delete \(photo.filename): \(error)")
+                        deletePaths.append(resolved.path)
+                        resolvedDeletions.append((photo: photo, path: resolved.path))
+                    } else {
+                        sipsErrors.append("\(photo.filename) (could not resolve remote path)")
+                    }
+                }
+
+                // Reconcile data.json: drop entries for deleted files.
+                if !deletePaths.isEmpty {
+                    if let data = api.downloadFile(owner: username, repo: Config.repoName, path: "docs/data.json"),
+                       let entries = (try? JSONSerialization.jsonObject(with: data)) as? [[String: String]] {
+                        let deletedBasenames = Set(deletePaths.map { ($0 as NSString).lastPathComponent })
+                        let filtered = entries.filter { entry in
+                            guard let url = entry["url"] else { return false }
+                            return !deletedBasenames.contains((url as NSString).lastPathComponent)
+                        }
+                        if let jsonData = try? JSONSerialization.data(withJSONObject: filtered, options: [.prettyPrinted, .sortedKeys]) {
+                            addFiles.append((path: "docs/data.json", content: jsonData))
                         }
                     }
                 }
 
-                // Reconcile data.json against the actual docs/media listing. Self-heals
-                // orphans left behind by earlier failed cleanups too.
-                if deleteCount > 0 || !rotated.isEmpty {
-                    self?.reconcileDataJSON(api: api, owner: username)
+                if !addFiles.isEmpty || !deletePaths.isEmpty {
+                    let parts = [
+                        rotatedSucceeded.isEmpty ? nil : "rotate \(rotatedSucceeded.count)",
+                        deletePaths.isEmpty ? nil : "delete \(deletePaths.count)",
+                    ].compactMap { $0 }
+                    do {
+                        _ = try api.uploadFilesAsOneCommit(
+                            owner: username,
+                            repo: Config.repoName,
+                            branch: "main",
+                            files: addFiles,
+                            deletions: deletePaths,
+                            message: "Review: \(parts.joined(separator: ", "))"
+                        )
+                        rotateCount = rotatedSucceeded.count
+                        deleteCount = resolvedDeletions.count
+                        for entry in resolvedDeletions {
+                            try? FileManager.default.removeItem(atPath: entry.photo.filePath)
+                        }
+                    } catch {
+                        uploadError = error.localizedDescription
+                    }
                 }
             }
 
-            let deletedIDs = Set(deleted.map { $0.id })
+            let appliedDeletedIDs = uploadError == nil ? Set(deleted.map { $0.id }) : Set<UUID>()
             DispatchQueue.main.async {
                 self?.isSaving = false
-                var parts: [String] = []
-                if count > 0 { parts.append("Rotated \(count) photo(s)") }
-                if deleteCount > 0 { parts.append("Deleted \(deleteCount) photo(s) from gallery") }
-                self?.saveMessage = parts.joined(separator: ". ") + "."
-                for photo in rotated {
-                    photo.rotation = 0
+                if let err = uploadError {
+                    self?.saveMessage = "Upload failed: \(err)"
+                    return
                 }
-                self?.photos.removeAll { deletedIDs.contains($0.id) }
+                var parts: [String] = []
+                if rotateCount > 0 { parts.append("Rotated \(rotateCount) photo(s)") }
+                if deleteCount > 0 { parts.append("Deleted \(deleteCount) photo(s) from gallery") }
+                if !sipsErrors.isEmpty {
+                    parts.append("Skipped \(sipsErrors.count): \(sipsErrors.prefix(3).joined(separator: ", "))")
+                }
+                self?.saveMessage = parts.isEmpty ? "No changes to apply." : (parts.joined(separator: ". ") + ".")
+                for photo in rotatedSucceeded { photo.rotation = 0 }
+                self?.photos.removeAll { appliedDeletedIDs.contains($0.id) }
             }
         }
     }
