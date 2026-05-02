@@ -46,7 +46,30 @@ public enum KeychainHelper {
         ]
 
         let status = SecItemAdd(query as CFDictionary, nil)
-        return status == errSecSuccess
+        guard status == errSecSuccess else { return false }
+
+        // After SecItemAdd, the item lives in the default partition list, which means
+        // every other binary (including charmera-mcp inside this same app bundle) hits
+        // a Keychain ACL prompt on first read. Whitelist any tool signed by our team
+        // so the helper goes through silently. Best-effort — if this fails the user
+        // just sees the legacy prompt and can click "Always Allow."
+        relaxPartitionList(account: key)
+        return true
+    }
+
+    private static func relaxPartitionList(account: String) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        proc.arguments = [
+            "set-key-partition-list",
+            "-S", "apple-tool:,apple:,teamid:P5EK689L33",
+            "-s", service,
+            "-a", account,
+        ]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        try? proc.run()
+        proc.waitUntilExit()
     }
 
     public static func load(key: String) -> String? {
