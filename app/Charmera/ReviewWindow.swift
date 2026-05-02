@@ -1,16 +1,23 @@
 import SwiftUI
 import AppKit
+import AVFoundation
 import CharmeraCore
 
 // MARK: - Review Data Model
+
+enum MediaKind {
+    case photo
+    case video
+}
 
 class ReviewPhoto: Identifiable, ObservableObject {
     let id = UUID()
     let filePath: String
     let filename: String
     let dateFolder: String
+    let mediaKind: MediaKind
     /// Size of the local file at the moment we loaded the review window. We snapshot it
-    /// because a sips rotate later in `applyChanges` rewrites the file with a different
+    /// because a rotate later in `applyChanges` rewrites the file with a different
     /// size — and the data.json hash key is `<filename>:<original-camera-size>`. Reading
     /// the post-rotation size would miss the mapping and silently clobber an unrelated
     /// older PICT0040.jpg-style entry.
@@ -24,18 +31,44 @@ class ReviewPhoto: Identifiable, ObservableObject {
     }
 
     var image: NSImage? {
-        NSImage(contentsOfFile: filePath)
+        switch mediaKind {
+        case .photo:
+            return NSImage(contentsOfFile: filePath)
+        case .video:
+            // Pull the first frame via AVFoundation. Cheaper than spawning ffmpeg per
+            // video on every Review-window open.
+            let asset = AVURLAsset(url: URL(fileURLWithPath: filePath))
+            let gen = AVAssetImageGenerator(asset: asset)
+            gen.appliesPreferredTrackTransform = true
+            gen.maximumSize = CGSize(width: 800, height: 800)
+            guard let cg = try? gen.copyCGImage(at: .zero, actualTime: nil) else { return nil }
+            return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        }
     }
 
     /// Lookup key into data.json's hash field. Stable across rotations.
+    /// For videos the importer keys the entry off the original AVI (`<aviName>:<aviSize>`),
+    /// so we look for the sibling AVI in the local backup and use its size — not the local
+    /// MP4's, which would miss the mapping and corrupt an unrelated older entry on collision.
     var dataKey: String {
-        "\(filename):\(originalSize)"
+        if mediaKind == .video,
+           filename.lowercased().hasSuffix(".mp4") {
+            let aviSibling = (filePath as NSString).deletingPathExtension + ".avi"
+            if FileManager.default.fileExists(atPath: aviSibling),
+               let attrs = try? FileManager.default.attributesOfItem(atPath: aviSibling) {
+                let aviSize = (attrs[.size] as? Int64) ?? (attrs[.size] as? Int).map(Int64.init) ?? 0
+                let aviName = (filename as NSString).deletingPathExtension + ".avi"
+                return "\(aviName):\(aviSize)"
+            }
+        }
+        return "\(filename):\(originalSize)"
     }
 
-    init(filePath: String, dateFolder: String) {
+    init(filePath: String, dateFolder: String, mediaKind: MediaKind) {
         self.filePath = filePath
         self.filename = URL(fileURLWithPath: filePath).lastPathComponent
         self.dateFolder = dateFolder
+        self.mediaKind = mediaKind
         let attrs = try? FileManager.default.attributesOfItem(atPath: filePath)
         self.originalSize = (attrs?[.size] as? Int64) ?? (attrs?[.size] as? Int).map(Int64.init) ?? 0
     }
@@ -71,8 +104,15 @@ class ReviewViewModel: ObservableObject {
             guard let files = try? fm.contentsOfDirectory(atPath: folderPath) else { continue }
             for file in files.sorted() {
                 let ext = (file as NSString).pathExtension.lowercased()
-                guard ext == "jpg" || ext == "jpeg" else { continue }
-                allPhotos.append(ReviewPhoto(filePath: "\(folderPath)/\(file)", dateFolder: folder))
+                let kind: MediaKind
+                if ext == "jpg" || ext == "jpeg" {
+                    kind = .photo
+                } else if ext == "mp4" {
+                    kind = .video
+                } else {
+                    continue
+                }
+                allPhotos.append(ReviewPhoto(filePath: "\(folderPath)/\(file)", dateFolder: folder, mediaKind: kind))
             }
         }
 
@@ -157,25 +197,74 @@ class ReviewViewModel: ObservableObject {
         }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            // Step 1: rotate locally with sips. Failures are real — surface them.
+            // Step 1: rotate locally — sips for photos, ffmpeg transpose for videos.
+            // Failures are real; surface them. Video re-encodes go to a tmp file then
+            // atomically replace the original so a crashed ffmpeg doesn't corrupt the file.
             var sipsErrors: [String] = []
             var rotatedSucceeded: [ReviewPhoto] = []
             for photo in rotated {
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
-                proc.arguments = ["-c", "/usr/bin/sips -r \(photo.rotation) '\(photo.filePath)' --out '\(photo.filePath)'"]
-                proc.standardOutput = FileHandle.nullDevice
-                proc.standardError = FileHandle.nullDevice
-                do {
-                    try proc.run()
-                    proc.waitUntilExit()
-                    if proc.terminationStatus == 0 {
-                        rotatedSucceeded.append(photo)
-                    } else {
-                        sipsErrors.append("\(photo.filename) (sips exit \(proc.terminationStatus))")
+                if photo.mediaKind == .photo {
+                    let proc = Process()
+                    proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
+                    proc.arguments = ["-c", "/usr/bin/sips -r \(photo.rotation) '\(photo.filePath)' --out '\(photo.filePath)'"]
+                    proc.standardOutput = FileHandle.nullDevice
+                    proc.standardError = FileHandle.nullDevice
+                    do {
+                        try proc.run()
+                        proc.waitUntilExit()
+                        if proc.terminationStatus == 0 {
+                            rotatedSucceeded.append(photo)
+                        } else {
+                            sipsErrors.append("\(photo.filename) (sips exit \(proc.terminationStatus))")
+                        }
+                    } catch {
+                        sipsErrors.append("\(photo.filename) (\(error.localizedDescription))")
                     }
-                } catch {
-                    sipsErrors.append("\(photo.filename) (\(error.localizedDescription))")
+                } else {
+                    // video
+                    let transpose: String
+                    switch photo.rotation {
+                    case 90:  transpose = "transpose=1"
+                    case 180: transpose = "transpose=2,transpose=2"
+                    case 270: transpose = "transpose=2"
+                    default:  transpose = "transpose=1"
+                    }
+                    let tmpOut = "\(photo.filePath).rotating-\(UUID().uuidString).mp4"
+                    let proc = Process()
+                    proc.executableURL = URL(fileURLWithPath: FFmpegManager.resolvedPath)
+                    proc.arguments = [
+                        "-y", "-i", photo.filePath,
+                        "-vf", transpose,
+                        "-c:v", "h264_videotoolbox", "-b:v", "2M",
+                        "-c:a", "aac", "-b:a", "128k",
+                        "-movflags", "+faststart",
+                        tmpOut,
+                    ]
+                    proc.standardOutput = FileHandle.nullDevice
+                    proc.standardError = FileHandle.nullDevice
+                    do {
+                        try proc.run()
+                        proc.waitUntilExit()
+                    } catch {
+                        sipsErrors.append("\(photo.filename) (\(error.localizedDescription))")
+                        continue
+                    }
+                    guard proc.terminationStatus == 0,
+                          FileManager.default.fileExists(atPath: tmpOut) else {
+                        try? FileManager.default.removeItem(atPath: tmpOut)
+                        sipsErrors.append("\(photo.filename) (ffmpeg exit \(proc.terminationStatus))")
+                        continue
+                    }
+                    do {
+                        _ = try FileManager.default.replaceItemAt(
+                            URL(fileURLWithPath: photo.filePath),
+                            withItemAt: URL(fileURLWithPath: tmpOut)
+                        )
+                        rotatedSucceeded.append(photo)
+                    } catch {
+                        try? FileManager.default.removeItem(atPath: tmpOut)
+                        sipsErrors.append("\(photo.filename) (replace: \(error.localizedDescription))")
+                    }
                 }
             }
 
