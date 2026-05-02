@@ -11,14 +11,16 @@ MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 
 echo "Building $APP_NAME..."
-swift build -c release 2>&1
+swift build -c release --product "$APP_NAME" 2>&1
+swift build -c release --product charmera-mcp 2>&1
 
 echo "Creating app bundle..."
 rm -rf "$BUNDLE_DIR"
 mkdir -p "$MACOS" "$RESOURCES"
 
-# Copy executable
+# Copy executables — main app + bundled MCP server
 cp ".build/release/$APP_NAME" "$MACOS/$APP_NAME"
+cp ".build/release/charmera-mcp" "$MACOS/charmera-mcp"
 
 # Copy Info.plist
 cp "$SCRIPT_DIR/Info.plist" "$CONTENTS/Info.plist"
@@ -42,7 +44,12 @@ if [ -d "$TEMPLATE_SRC" ]; then
     echo "Bundled gallery template."
 fi
 
-# Code sign (use Developer ID if available, otherwise ad-hoc)
+# Code sign (use Developer ID if available, otherwise ad-hoc).
+# Note: the MCP helper does NOT use keychain-access-groups entitlements —
+# Developer ID signing without a provisioning profile silently breaks any
+# binary that declares them. The MCP reads tokens via the `security` CLI,
+# which goes through the user's login keychain (one ACL prompt on first run,
+# then "Always Allow").
 IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application" | head -1 | awk -F'"' '{print $2}' || true)
 if [ -n "${IDENTITY:-}" ]; then
     echo "Signing with: $IDENTITY"

@@ -1,0 +1,314 @@
+import Foundation
+import MCP
+import CharmeraCore
+
+// MARK: - Helpers
+
+func text(_ s: String) -> Tool.Content {
+    .text(text: s, annotations: nil, _meta: nil)
+}
+
+func jsonText(_ object: Any) -> Tool.Content {
+    let data = (try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])) ?? Data("{}".utf8)
+    return text(String(data: data, encoding: .utf8) ?? "{}")
+}
+
+func errText(_ message: String) -> CallTool.Result {
+    .init(content: [text(message)], isError: true)
+}
+
+/// Read a Keychain item via the `security` CLI. The MCP helper is signed
+/// with a different identifier than Charmera.app, so it can't read tokens
+/// directly via SecItemCopyMatching (the items live in a different access
+/// group, and `keychain-access-groups` entitlements require a provisioning
+/// profile that Developer ID signing doesn't bundle). The `security` CLI
+/// goes through Security.framework with the user's login keychain — the
+/// first read prompts the user, who can click "Always Allow."
+func readKeychain(account: String, service: String = "com.charmera.app") -> String? {
+    let proc = Process()
+    let stdoutPipe = Pipe()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    proc.arguments = ["find-generic-password", "-s", service, "-a", account, "-w"]
+    proc.standardOutput = stdoutPipe
+    proc.standardError = FileHandle.nullDevice
+    do {
+        try proc.run()
+        proc.waitUntilExit()
+    } catch {
+        return nil
+    }
+    guard proc.terminationStatus == 0 else { return nil }
+    let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+    return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+func githubAuth() -> (token: String, username: String)? {
+    guard let token = readKeychain(account: "github_token"),
+          let username = readKeychain(account: "github_username") else { return nil }
+    return (token, username)
+}
+
+// MARK: - Tool Definitions
+
+let tools: [Tool] = [
+    Tool(
+        name: "detect_camera",
+        description: "Check whether the Kodak Charmera camera is plugged in. Returns connection status and the path to the camera's DCIM directory if mounted.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([:]),
+        ])
+    ),
+    Tool(
+        name: "list_camera_files",
+        description: "List photo and video files currently on the camera's SD card. Does not copy or modify anything. Returns filename, size, and kind (photo/video) for each.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([:]),
+        ])
+    ),
+    Tool(
+        name: "read_gallery_data",
+        description: "Fetch the gallery's data.json from GitHub. Returns the array of all media entries (filename, url, type, hash, timestamp). Use this to answer questions about what has been imported.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([:]),
+        ])
+    ),
+    Tool(
+        name: "rotate_photo",
+        description: "Rotate a local photo file in place by 90, 180, or 270 degrees clockwise. Uses /usr/bin/sips. Operates on a local backup file path under ~/Pictures/Charmera.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "path": .object(["type": .string("string"), "description": .string("Absolute path to the local photo file")]),
+                "degrees": .object(["type": .string("integer"), "description": .string("Clockwise rotation in degrees: 90, 180, or 270"), "enum": .array([.int(90), .int(180), .int(270)])]),
+            ]),
+            "required": .array([.string("path"), .string("degrees")]),
+        ])
+    ),
+    Tool(
+        name: "push_to_gallery",
+        description: "Upload, rotate, or delete files in the GitHub gallery in a single commit (one Pages build). Adds are local file paths uploaded to docs/media/. Deletes are gallery filenames (the bare name, not docs/media/<name>). Optionally updates data.json entries by passing dataJsonEntries (replaces the whole array).",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "adds": .object(["type": .string("array"), "items": .object(["type": .string("object"), "properties": .object(["localPath": .object(["type": .string("string")]), "galleryFilename": .object(["type": .string("string")])])])]),
+                "deletes": .object(["type": .string("array"), "items": .object(["type": .string("string")])]),
+                "message": .object(["type": .string("string"), "description": .string("Commit message")]),
+                "dataJsonEntries": .object(["type": .string("array"), "description": .string("Optional. If provided, replaces docs/data.json with these entries. Each entry is {type, filename, url, hash, timestamp}.")]),
+            ]),
+            "required": .array([.string("message")]),
+        ])
+    ),
+    Tool(
+        name: "import_roll",
+        description: "Run the full Charmera import pipeline: detect camera, copy new files, fix orientation, convert AVI→MP4, and push to the GitHub gallery in a single commit. By default skips Photos.app integration (the menu-bar Charmera.app handles that). Returns counts and any errors.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "skipPhotosImport": .object(["type": .string("boolean"), "description": .string("Skip the Photos.app step (default true for MCP — the .app handles it)"), "default": .bool(true)]),
+                "skipVideoConversion": .object(["type": .string("boolean"), "description": .string("Skip AVI→MP4 conversion (default false)"), "default": .bool(false)]),
+            ]),
+        ])
+    ),
+    Tool(
+        name: "auth_status",
+        description: "Check whether the Charmera GitHub credentials are present in the user's Keychain. Returns the GitHub username and gallery repo info if signed in.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([:]),
+        ])
+    ),
+]
+
+// MARK: - Server
+
+let server = Server(
+    name: "charmera-mcp",
+    version: "0.1.0",
+    capabilities: .init(tools: .init(listChanged: false))
+)
+
+await server.withMethodHandler(ListTools.self) { _ in
+    .init(tools: tools)
+}
+
+await server.withMethodHandler(CallTool.self) { params in
+    switch params.name {
+
+    case "detect_camera":
+        if let path = Config.cameraVolumePath {
+            return .init(content: [jsonText(["connected": true, "mountPath": path])], isError: false)
+        }
+        return .init(content: [jsonText(["connected": false])], isError: false)
+
+    case "list_camera_files":
+        guard let cameraPath = Config.cameraVolumePath else {
+            return errText("No camera connected.")
+        }
+        let fm = FileManager.default
+        let dcimURL = URL(fileURLWithPath: cameraPath)
+        var files: [[String: Any]] = []
+        let enumerator = fm.enumerator(at: dcimURL, includingPropertiesForKeys: [.fileSizeKey])
+        while let url = enumerator?.nextObject() as? URL {
+            let name = url.lastPathComponent
+            let upper = name.uppercased()
+            let isPhoto = upper.hasPrefix("PICT") && upper.hasSuffix(".JPG")
+            let isVideo = upper.hasPrefix("MOVI") && upper.hasSuffix(".AVI")
+            guard isPhoto || isVideo else { continue }
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            files.append([
+                "name": name,
+                "size": size,
+                "kind": isPhoto ? "photo" : "video",
+            ])
+        }
+        return .init(content: [jsonText(["files": files, "count": files.count])], isError: false)
+
+    case "read_gallery_data":
+        guard let auth = githubAuth() else {
+            return errText("Not signed in to GitHub. Open the Charmera menu-bar app to authenticate.")
+        }
+        let api = GitHubAPI(token: auth.token)
+        guard let data = api.downloadFile(owner: auth.username, repo: Config.repoName, path: "docs/data.json") else {
+            return errText("Could not download docs/data.json from \(auth.username)/\(Config.repoName).")
+        }
+        let str = String(data: data, encoding: .utf8) ?? "[]"
+        return .init(content: [text(str)], isError: false)
+
+    case "rotate_photo":
+        guard let path = params.arguments?["path"]?.stringValue,
+              let degrees = params.arguments?["degrees"]?.intValue else {
+            return errText("Missing 'path' or 'degrees'.")
+        }
+        guard [90, 180, 270].contains(degrees) else {
+            return errText("'degrees' must be 90, 180, or 270.")
+        }
+        guard FileManager.default.fileExists(atPath: path) else {
+            return errText("File not found: \(path)")
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/sips")
+        proc.arguments = ["-r", String(degrees), path, "--out", path]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            if proc.terminationStatus != 0 {
+                return errText("sips returned non-zero status: \(proc.terminationStatus)")
+            }
+        } catch {
+            return errText("sips failed: \(error.localizedDescription)")
+        }
+        return .init(content: [jsonText(["rotated": true, "path": path, "degrees": degrees])], isError: false)
+
+    case "push_to_gallery":
+        guard let auth = githubAuth() else {
+            return errText("Not signed in to GitHub.")
+        }
+        guard let message = params.arguments?["message"]?.stringValue else {
+            return errText("Missing 'message'.")
+        }
+        let api = GitHubAPI(token: auth.token)
+
+        // Build adds
+        var filesToUpload: [(path: String, content: Data)] = []
+        if let addsArray = params.arguments?["adds"]?.arrayValue {
+            for entry in addsArray {
+                guard let dict = entry.objectValue,
+                      let local = dict["localPath"]?.stringValue,
+                      let gallery = dict["galleryFilename"]?.stringValue,
+                      let data = FileManager.default.contents(atPath: local) else { continue }
+                filesToUpload.append((path: "docs/media/\(gallery)", content: data))
+            }
+        }
+
+        // Build deletes
+        var deletes: [String] = []
+        if let delArray = params.arguments?["deletes"]?.arrayValue {
+            for v in delArray {
+                if let s = v.stringValue { deletes.append("docs/media/\(s)") }
+            }
+        }
+
+        // Optional data.json replacement
+        if let entries = params.arguments?["dataJsonEntries"]?.arrayValue {
+            // Convert MCP Value array → plain array → JSON
+            let plain: [[String: Any]] = entries.compactMap { v in
+                guard let obj = v.objectValue else { return nil }
+                var dict: [String: Any] = [:]
+                for (k, vv) in obj {
+                    if let s = vv.stringValue { dict[k] = s }
+                    else if let i = vv.intValue { dict[k] = i }
+                    else if let b = vv.boolValue { dict[k] = b }
+                }
+                return dict
+            }
+            if let json = try? JSONSerialization.data(withJSONObject: plain, options: [.prettyPrinted, .sortedKeys]) {
+                filesToUpload.append((path: "docs/data.json", content: json))
+            }
+        }
+
+        guard !filesToUpload.isEmpty || !deletes.isEmpty else {
+            return errText("Nothing to push: provide at least one of adds, deletes, or dataJsonEntries.")
+        }
+
+        do {
+            let sha = try api.uploadFilesAsOneCommit(
+                owner: auth.username,
+                repo: Config.repoName,
+                branch: "main",
+                files: filesToUpload,
+                deletions: deletes,
+                message: message
+            )
+            return .init(content: [jsonText([
+                "commit": sha,
+                "uploaded": filesToUpload.count,
+                "deleted": deletes.count,
+                "pagesUrl": "https://\(auth.username).github.io/\(Config.repoName)/",
+            ])], isError: false)
+        } catch {
+            return errText("Push failed: \(error.localizedDescription)")
+        }
+
+    case "import_roll":
+        let skipPhotos = params.arguments?["skipPhotosImport"]?.boolValue ?? true
+        let skipVideo = params.arguments?["skipVideoConversion"]?.boolValue ?? false
+        let importer = Importer()
+        var statusLog: [String] = []
+        importer.onStatus = { statusLog.append($0) }
+        let result = importer.run(reviewOnly: false, skipVideoConversion: skipVideo, skipPhotosImport: skipPhotos)
+        switch result {
+        case .success(let counts):
+            return .init(content: [jsonText([
+                "photos": counts.photos,
+                "videos": counts.videos,
+                "skippedPhotosApp": skipPhotos,
+                "status": statusLog,
+            ])], isError: false)
+        case .failure(let error):
+            return errText("Import failed: \(error.localizedDescription)")
+        }
+
+    case "auth_status":
+        guard let auth = githubAuth() else {
+            return .init(content: [jsonText(["signedIn": false])], isError: false)
+        }
+        return .init(content: [jsonText([
+            "signedIn": true,
+            "username": auth.username,
+            "repo": Config.repoName,
+            "galleryUrl": "https://\(auth.username).github.io/\(Config.repoName)/",
+        ])], isError: false)
+
+    default:
+        return errText("Unknown tool: \(params.name)")
+    }
+}
+
+let transport = StdioTransport()
+try await server.start(transport: transport)
+await server.waitUntilCompleted()

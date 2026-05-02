@@ -18,16 +18,16 @@ public class Importer {
 
     public init() {}
 
-    public func run(reviewOnly: Bool = false, skipVideoConversion: Bool = false) -> Result<ImportCounts, Error> {
+    public func run(reviewOnly: Bool = false, skipVideoConversion: Bool = false, skipPhotosImport: Bool = false) -> Result<ImportCounts, Error> {
         do {
-            let counts = try performImport(reviewOnly: reviewOnly, skipVideoConversion: skipVideoConversion)
+            let counts = try performImport(reviewOnly: reviewOnly, skipVideoConversion: skipVideoConversion, skipPhotosImport: skipPhotosImport)
             return .success(counts)
         } catch {
             return .failure(error)
         }
     }
 
-    private func performImport(reviewOnly: Bool = false, skipVideoConversion: Bool = false) throws -> ImportCounts {
+    private func performImport(reviewOnly: Bool = false, skipVideoConversion: Bool = false, skipPhotosImport: Bool = false) throws -> ImportCounts {
         let fm = FileManager.default
         try fm.createDirectory(atPath: Config.localBackupRoot, withIntermediateDirectories: true)
 
@@ -150,7 +150,7 @@ public class Importer {
         }
 
         // 6. Import to Photos.app (if enabled)
-        let importToPhotos = UserDefaults.standard.object(forKey: "importToPhotos") as? Bool ?? true
+        let importToPhotos = !skipPhotosImport && (UserDefaults.standard.object(forKey: "importToPhotos") as? Bool ?? true)
         if importToPhotos {
             let semaphore = DispatchSemaphore(value: 0)
             var hasAccess = false
