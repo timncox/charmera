@@ -4,11 +4,13 @@ public struct ImportCounts {
     public let photos: Int
     public let videos: Int
     public let reviewOnly: Bool
+    public let localPaths: [String]
 
-    public init(photos: Int, videos: Int, reviewOnly: Bool = false) {
+    public init(photos: Int, videos: Int, reviewOnly: Bool = false, localPaths: [String] = []) {
         self.photos = photos
         self.videos = videos
         self.reviewOnly = reviewOnly
+        self.localPaths = localPaths
     }
 }
 
@@ -18,16 +20,34 @@ public class Importer {
 
     public init() {}
 
-    public func run(reviewOnly: Bool = false, skipVideoConversion: Bool = false, skipPhotosImport: Bool = false) -> Result<ImportCounts, Error> {
+    public func run(
+        reviewOnly: Bool = false,
+        skipVideoConversion: Bool = false,
+        skipPhotosImport: Bool = false,
+        skipOrientation: Bool = false,
+        skipUpload: Bool = false
+    ) -> Result<ImportCounts, Error> {
         do {
-            let counts = try performImport(reviewOnly: reviewOnly, skipVideoConversion: skipVideoConversion, skipPhotosImport: skipPhotosImport)
+            let counts = try performImport(
+                reviewOnly: reviewOnly,
+                skipVideoConversion: skipVideoConversion,
+                skipPhotosImport: skipPhotosImport,
+                skipOrientation: skipOrientation,
+                skipUpload: skipUpload
+            )
             return .success(counts)
         } catch {
             return .failure(error)
         }
     }
 
-    private func performImport(reviewOnly: Bool = false, skipVideoConversion: Bool = false, skipPhotosImport: Bool = false) throws -> ImportCounts {
+    private func performImport(
+        reviewOnly: Bool = false,
+        skipVideoConversion: Bool = false,
+        skipPhotosImport: Bool = false,
+        skipOrientation: Bool = false,
+        skipUpload: Bool = false
+    ) throws -> ImportCounts {
         let fm = FileManager.default
         try fm.createDirectory(atPath: Config.localBackupRoot, withIntermediateDirectories: true)
 
@@ -104,13 +124,17 @@ public class Importer {
         }
 
         // 4. Detect orientation and rotate photos
-        onStatus?("Fixing orientation...")
-        for photoPath in localPhotos {
-            let degrees = OrientationDetector.detectRotation(imagePath: photoPath)
-            if degrees != 0 {
-                print("[Importer] Rotating \(URL(fileURLWithPath: photoPath).lastPathComponent) by \(degrees)")
-                let sipsCommand = "/usr/bin/sips -r \(degrees) \(shellEscape(photoPath)) --out \(shellEscape(photoPath))"
-                _ = runShell(sipsCommand)
+        if skipOrientation {
+            print("[Importer] Skipping auto-orientation (caller will curate)")
+        } else {
+            onStatus?("Fixing orientation...")
+            for photoPath in localPhotos {
+                let degrees = OrientationDetector.detectRotation(imagePath: photoPath)
+                if degrees != 0 {
+                    print("[Importer] Rotating \(URL(fileURLWithPath: photoPath).lastPathComponent) by \(degrees)")
+                    let sipsCommand = "/usr/bin/sips -r \(degrees) \(shellEscape(photoPath)) --out \(shellEscape(photoPath))"
+                    _ = runShell(sipsCommand)
+                }
             }
         }
 
@@ -146,7 +170,12 @@ public class Importer {
                 }
             }
 
-            return ImportCounts(photos: localPhotos.count, videos: convertedVideos.count, reviewOnly: true)
+            return ImportCounts(
+                photos: localPhotos.count,
+                videos: convertedVideos.count,
+                reviewOnly: true,
+                localPaths: localPhotos + convertedVideos
+            )
         }
 
         // 6. Import to Photos.app (if enabled)
@@ -170,6 +199,20 @@ public class Importer {
             } else {
                 print("[Importer] Photos access denied — skipping Photos.app import")
             }
+        }
+
+        // Stop here if the caller wants to drive the upload + Photos.app phase themselves
+        // (e.g. charmera-mcp's curated flow: prepare → Claude reviews + rotates → finish).
+        // We persist the hashes so a later import_roll call doesn't double-copy these files,
+        // and we leave the camera files in place — finish_camera_import handles deletion.
+        if skipUpload {
+            saveImportedHashes(existing: importedHashes, new: allHashes)
+            return ImportCounts(
+                photos: localPhotos.count,
+                videos: convertedVideos.count,
+                reviewOnly: false,
+                localPaths: localPhotos + convertedVideos
+            )
         }
 
         // 7. Upload everything in a single commit via the Git Data API.
@@ -295,7 +338,11 @@ public class Importer {
             print("[Importer] Some uploads failed - keeping files on camera and not saving hashes")
         }
 
-        return ImportCounts(photos: localPhotos.count, videos: convertedVideos.count)
+        return ImportCounts(
+            photos: localPhotos.count,
+            videos: convertedVideos.count,
+            localPaths: localPhotos + convertedVideos
+        )
     }
 
     // MARK: - File Discovery

@@ -113,6 +113,38 @@ let tools: [Tool] = [
         ])
     ),
     Tool(
+        name: "read_photo",
+        description: "Read a local photo file and return it as image content so the model can see it. Use this to evaluate orientation, blur, composition, etc. before pushing to the gallery or Photos.app. Path is the absolute filesystem path (typically under ~/Pictures/Charmera/<date>/).",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "path": .object(["type": .string("string"), "description": .string("Absolute path to a local photo")]),
+            ]),
+            "required": .array([.string("path")]),
+        ])
+    ),
+    Tool(
+        name: "import_to_photos",
+        description: "Import the given local files into the user's Photos.app library, adding them to the 'Charmera' album. Delegates to Charmera.app (which owns the Photos.app TCC scope) — make sure /Applications/Charmera.app is installed. Returns a JSON summary with imported/requested counts.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "paths": .object(["type": .string("array"), "items": .object(["type": .string("string")]), "description": .string("Absolute paths of photos/videos to import")]),
+            ]),
+            "required": .array([.string("paths")]),
+        ])
+    ),
+    Tool(
+        name: "prepare_camera_import",
+        description: "Phase 1 of a curated import: copy new photos+videos from the camera to a local backup folder WITHOUT auto-orientation, GitHub upload, or Photos.app import. Returns the list of local paths the model can read_photo + rotate_photo, then push via push_to_gallery + import_to_photos. Updates the imported-hashes file so a later import_roll won't double-copy.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "skipVideoConversion": .object(["type": .string("boolean"), "description": .string("Skip AVI→MP4 conversion (default false)"), "default": .bool(false)]),
+            ]),
+        ])
+    ),
+    Tool(
         name: "auth_status",
         description: "Check whether the Charmera GitHub credentials are present in the user's Keychain. Returns the GitHub username and gallery repo info if signed in.",
         inputSchema: .object([
@@ -291,6 +323,77 @@ await server.withMethodHandler(CallTool.self) { params in
             ])], isError: false)
         case .failure(let error):
             return errText("Import failed: \(error.localizedDescription)")
+        }
+
+    case "read_photo":
+        guard let path = params.arguments?["path"]?.stringValue else {
+            return errText("Missing 'path'.")
+        }
+        guard let data = FileManager.default.contents(atPath: path) else {
+            return errText("Could not read file: \(path)")
+        }
+        let ext = (path as NSString).pathExtension.lowercased()
+        let mime: String
+        switch ext {
+        case "jpg", "jpeg": mime = "image/jpeg"
+        case "png":         mime = "image/png"
+        case "heic":        mime = "image/heic"
+        default:            mime = "application/octet-stream"
+        }
+        let b64 = data.base64EncodedString()
+        return .init(content: [.image(data: b64, mimeType: mime, annotations: nil, _meta: nil)], isError: false)
+
+    case "import_to_photos":
+        guard let pathsArr = params.arguments?["paths"]?.arrayValue else {
+            return errText("Missing 'paths' array.")
+        }
+        let paths: [String] = pathsArr.compactMap { $0.stringValue }
+        guard !paths.isEmpty else {
+            return errText("'paths' is empty.")
+        }
+        let charmeraBin = "/Applications/Charmera.app/Contents/MacOS/Charmera"
+        guard FileManager.default.isExecutableFile(atPath: charmeraBin) else {
+            return errText("Charmera.app not installed at /Applications/Charmera.app — install via `brew install --cask timncox/charmera/charmera` or build locally.")
+        }
+        let proc = Process()
+        let stdoutPipe = Pipe()
+        proc.executableURL = URL(fileURLWithPath: charmeraBin)
+        proc.arguments = ["--import-photos"] + paths
+        proc.standardOutput = stdoutPipe
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            return errText("Charmera --import-photos failed to launch: \(error.localizedDescription)")
+        }
+        let out = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let outStr = String(data: out, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return .init(content: [text(outStr.isEmpty ? "{}" : outStr)], isError: proc.terminationStatus != 0)
+
+    case "prepare_camera_import":
+        let skipVideo = params.arguments?["skipVideoConversion"]?.boolValue ?? false
+        let importer = Importer()
+        var statusLog: [String] = []
+        importer.onStatus = { statusLog.append($0) }
+        let result = importer.run(
+            reviewOnly: false,
+            skipVideoConversion: skipVideo,
+            skipPhotosImport: true,
+            skipOrientation: true,
+            skipUpload: true
+        )
+        switch result {
+        case .success(let counts):
+            return .init(content: [jsonText([
+                "photos": counts.photos,
+                "videos": counts.videos,
+                "localPaths": counts.localPaths,
+                "status": statusLog,
+                "nextSteps": "For each photo: read_photo → rotate_photo (if needed). Then push_to_gallery + import_to_photos with the final paths.",
+            ])], isError: false)
+        case .failure(let error):
+            return errText("prepare_camera_import failed: \(error.localizedDescription)")
         }
 
     case "auth_status":
