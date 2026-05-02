@@ -43,10 +43,25 @@ rm -rf "$DMG_DIR"
 
 echo "Created: $DMG_PATH ($(du -h "$DMG_PATH" | cut -f1))"
 
-if ! xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
+notary_check_output="$(xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" 2>&1 || true)"
+notary_check_exit="$?"
+if echo "$notary_check_output" | grep -q "could not be found in the keychain"; then
     echo ""
     echo "Skipping notarization: keychain profile '$NOTARY_PROFILE' not set up."
     echo "See the header of dmg.sh for one-time setup instructions."
+    exit 0
+elif echo "$notary_check_output" | grep -qi "401\|invalid credentials"; then
+    echo ""
+    echo "Skipping notarization: keychain profile '$NOTARY_PROFILE' was rejected by Apple (401)."
+    echo "The profile exists but the stored credentials are invalid. Re-run:"
+    echo "  xcrun notarytool store-credentials $NOTARY_PROFILE \\"
+    echo "    --apple-id timcox@gmail.com --team-id P5EK689L33"
+    echo "See the header of dmg.sh for the full setup steps."
+    exit 0
+elif [ "$notary_check_exit" != "0" ]; then
+    echo ""
+    echo "Skipping notarization: notarytool history failed for profile '$NOTARY_PROFILE'."
+    echo "$notary_check_output" | head -5
     exit 0
 fi
 
