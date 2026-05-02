@@ -2,10 +2,10 @@ import Foundation
 import Vision
 import AppKit
 
-enum OrientationDetector {
+public enum OrientationDetector {
 
     /// Clockwise rotation (0, 90, 180, 270) needed to make an image upright.
-    static func detectRotation(imagePath: String) -> Int {
+    public static func detectRotation(imagePath: String) -> Int {
         guard let image = NSImage(contentsOfFile: imagePath),
               let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             return 0

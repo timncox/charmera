@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import CharmeraCore
 
 // MARK: - Setup State
 

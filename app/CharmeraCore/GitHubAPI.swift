@@ -1,13 +1,17 @@
 import Foundation
 
-struct GitHubAPI {
-    let token: String
+public struct GitHubAPI {
+    public let token: String
 
     private let baseURL = "https://api.github.com"
 
+    public init(token: String) {
+        self.token = token
+    }
+
     // MARK: - Public Methods
 
-    func getUsername() throws -> String {
+    public func getUsername() throws -> String {
         let data = try request(method: "GET", path: "/user")
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let login = json["login"] as? String else {
@@ -16,7 +20,7 @@ struct GitHubAPI {
         return login
     }
 
-    func createRepo(name: String) throws {
+    public func createRepo(name: String) throws {
         let body: [String: Any] = [
             "name": name,
             "auto_init": true,
@@ -32,7 +36,7 @@ struct GitHubAPI {
     }
 
     @discardableResult
-    func uploadFile(owner: String, repo: String, path: String, content: Data, message: String, sha: String? = nil) throws -> String {
+    public func uploadFile(owner: String, repo: String, path: String, content: Data, message: String, sha: String? = nil) throws -> String {
         let base64 = content.base64EncodedString()
         var body: [String: Any] = [
             "message": message,
@@ -56,7 +60,7 @@ struct GitHubAPI {
     /// One commit means one Pages build, instead of N rapid-fire builds that overwhelm the legacy
     /// builder and cause cascading "Page build failed" errors.
     @discardableResult
-    func uploadFilesAsOneCommit(
+    public func uploadFilesAsOneCommit(
         owner: String,
         repo: String,
         branch: String,
@@ -145,7 +149,7 @@ struct GitHubAPI {
         return newCommitSHA
     }
 
-    func deleteFile(owner: String, repo: String, path: String, sha: String, message: String) throws {
+    public func deleteFile(owner: String, repo: String, path: String, sha: String, message: String) throws {
         let body: [String: Any] = [
             "message": message,
             "sha": sha,
@@ -153,7 +157,7 @@ struct GitHubAPI {
         _ = try request(method: "DELETE", path: "/repos/\(owner)/\(repo)/contents/\(path)", body: body, allowedStatuses: [200])
     }
 
-    func getFileSHA(owner: String, repo: String, path: String) -> String? {
+    public func getFileSHA(owner: String, repo: String, path: String) -> String? {
         do {
             let data = try request(method: "GET", path: "/repos/\(owner)/\(repo)/contents/\(path)")
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -166,7 +170,7 @@ struct GitHubAPI {
         return nil
     }
 
-    func downloadFile(owner: String, repo: String, path: String) -> Data? {
+    public func downloadFile(owner: String, repo: String, path: String) -> Data? {
         do {
             let data = try request(method: "GET", path: "/repos/\(owner)/\(repo)/contents/\(path)")
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -183,7 +187,7 @@ struct GitHubAPI {
 
     /// Returns the set of filenames in a repo directory, or nil on error.
     /// Note: GitHub Contents API caps directory listings at 1000 entries; gallery is well under.
-    func listDirectoryFilenames(owner: String, repo: String, path: String) -> Set<String>? {
+    public func listDirectoryFilenames(owner: String, repo: String, path: String) -> Set<String>? {
         do {
             let data = try request(method: "GET", path: "/repos/\(owner)/\(repo)/contents/\(path)")
             guard let arr = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
@@ -193,7 +197,7 @@ struct GitHubAPI {
         }
     }
 
-    func enablePages(owner: String, repo: String) throws {
+    public func enablePages(owner: String, repo: String) throws {
         let body: [String: Any] = [
             "source": [
                 "branch": "main",
@@ -209,7 +213,7 @@ struct GitHubAPI {
         }
     }
 
-    func pushTemplate(owner: String, repo: String, templateDir: String) throws {
+    public func pushTemplate(owner: String, repo: String, templateDir: String) throws {
         let fm = FileManager.default
 
         // Upload README.md if it exists
@@ -288,13 +292,13 @@ struct GitHubAPI {
     }
 }
 
-enum GitHubError: Error, LocalizedError {
+public enum GitHubError: Error, LocalizedError {
     case invalidURL(String)
     case network(String)
     case httpStatus(Int, String)
     case unexpectedResponse(String)
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .invalidURL(let path):
             return "Invalid URL: \(path)"

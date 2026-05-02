@@ -1,22 +1,24 @@
 import Foundation
 
-struct ImportCounts {
-    let photos: Int
-    let videos: Int
-    let reviewOnly: Bool
+public struct ImportCounts {
+    public let photos: Int
+    public let videos: Int
+    public let reviewOnly: Bool
 
-    init(photos: Int, videos: Int, reviewOnly: Bool = false) {
+    public init(photos: Int, videos: Int, reviewOnly: Bool = false) {
         self.photos = photos
         self.videos = videos
         self.reviewOnly = reviewOnly
     }
 }
 
-class Importer {
+public class Importer {
 
-    var onStatus: ((String) -> Void)?
+    public var onStatus: ((String) -> Void)?
 
-    func run(reviewOnly: Bool = false, skipVideoConversion: Bool = false) -> Result<ImportCounts, Error> {
+    public init() {}
+
+    public func run(reviewOnly: Bool = false, skipVideoConversion: Bool = false) -> Result<ImportCounts, Error> {
         do {
             let counts = try performImport(reviewOnly: reviewOnly, skipVideoConversion: skipVideoConversion)
             return .success(counts)
@@ -403,11 +405,11 @@ class Importer {
 
 // MARK: - Import Errors
 
-enum ImportError: Error, LocalizedError {
+public enum ImportError: Error, LocalizedError {
     case notAuthenticated
     case noCameraFound
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .notAuthenticated:
             return "Not signed in to GitHub. Open Charmera preferences to sign in."

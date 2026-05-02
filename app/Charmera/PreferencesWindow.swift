@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import ServiceManagement
+import CharmeraCore
 
 // MARK: - PreferencesView
 

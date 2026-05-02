@@ -1,13 +1,13 @@
 import Foundation
 import Security
 
-enum KeychainHelper {
+public enum KeychainHelper {
 
     private static let service = "com.charmera.app"
 
     // MARK: - Convenience Properties
 
-    static var githubToken: String? {
+    public static var githubToken: String? {
         get { load(key: "github_token") }
         set {
             if let value = newValue {
@@ -18,7 +18,7 @@ enum KeychainHelper {
         }
     }
 
-    static var githubUsername: String? {
+    public static var githubUsername: String? {
         get { load(key: "github_username") }
         set {
             if let value = newValue {
@@ -32,7 +32,7 @@ enum KeychainHelper {
     // MARK: - Core Operations
 
     @discardableResult
-    static func save(key: String, value: String) -> Bool {
+    public static func save(key: String, value: String) -> Bool {
         guard let data = value.data(using: .utf8) else { return false }
 
         // Delete any existing item first
@@ -49,7 +49,7 @@ enum KeychainHelper {
         return status == errSecSuccess
     }
 
-    static func load(key: String) -> String? {
+    public static func load(key: String) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -69,7 +69,7 @@ enum KeychainHelper {
     }
 
     @discardableResult
-    static func delete(key: String) -> Bool {
+    public static func delete(key: String) -> Bool {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,

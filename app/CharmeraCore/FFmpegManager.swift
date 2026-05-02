@@ -1,17 +1,17 @@
 import Foundation
 
-enum FFmpegManager {
+public enum FFmpegManager {
 
-    static let ffmpegPath: String = {
+    public static let ffmpegPath: String = {
         return "\(Config.appSupportDir)/ffmpeg"
     }()
 
-    static var isAvailable: Bool {
+    public static var isAvailable: Bool {
         FileManager.default.isExecutableFile(atPath: ffmpegPath)
     }
 
     /// Decompress bundled ffmpeg.xz from app resources, or fall back to Homebrew.
-    static func ensureAvailable() {
+    public static func ensureAvailable() {
         if isAvailable { return }
 
         // Try to decompress bundled ffmpeg.xz from app resources
@@ -49,7 +49,7 @@ enum FFmpegManager {
     }
 
     /// Returns whichever path has the executable — bundled or Homebrew fallback.
-    static var resolvedPath: String {
+    public static var resolvedPath: String {
         if isAvailable {
             return ffmpegPath
         }

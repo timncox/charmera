@@ -1,14 +1,14 @@
 import Foundation
 import Photos
 
-enum PhotosImporter {
+public enum PhotosImporter {
 
     // We request `.readWrite` (not `.addOnly`) because adding into a named album requires
     // fetching that album — and `.addOnly` is a write-only scope where
     // `PHAssetCollection.fetchAssetCollections` returns nothing, including albums the app
     // would create itself. Under `.addOnly`, `findOrCreateAlbum` always falls through to the
     // "could not be re-fetched" error and zero photos land in Photos.app.
-    static func requestAccessIfNeeded(completion: @escaping (Bool) -> Void) {
+    public static func requestAccessIfNeeded(completion: @escaping (Bool) -> Void) {
         let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         switch status {
         case .authorized, .limited:
@@ -31,7 +31,7 @@ enum PhotosImporter {
     /// import via AppleScript runs at ~30s/file under load — anything past ~4 files would silently
     /// time out and drop the rest of the batch.
     @discardableResult
-    static func importFiles(_ paths: [String]) -> Int {
+    public static func importFiles(_ paths: [String]) -> Int {
         guard !paths.isEmpty else { return 0 }
 
         let albumName = "Charmera"
