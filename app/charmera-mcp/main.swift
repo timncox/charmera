@@ -113,6 +113,29 @@ let tools: [Tool] = [
         ])
     ),
     Tool(
+        name: "read_video_frame",
+        description: "Extract the first frame of a local video and return it as image content so the model can evaluate orientation. Use before deciding whether to call rotate_video. Path is the absolute filesystem path to an .mp4 (or any ffmpeg-readable video).",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "path": .object(["type": .string("string"), "description": .string("Absolute path to a local video")]),
+            ]),
+            "required": .array([.string("path")]),
+        ])
+    ),
+    Tool(
+        name: "rotate_video",
+        description: "Rotate a local video file by 90, 180, or 270 degrees clockwise. Re-encodes via ffmpeg with -vf transpose; slower than rotate_photo but rare. Operates in place — the file is replaced atomically on success. Use only when convertAVItoMP4's auto-orient picked the wrong rotation.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "path": .object(["type": .string("string"), "description": .string("Absolute path to a local .mp4")]),
+                "degrees": .object(["type": .string("integer"), "description": .string("Clockwise rotation: 90, 180, or 270"), "enum": .array([.int(90), .int(180), .int(270)])]),
+            ]),
+            "required": .array([.string("path"), .string("degrees")]),
+        ])
+    ),
+    Tool(
         name: "read_photo",
         description: "Read a local photo file and return it as image content so the model can see it. Use this to evaluate orientation, blur, composition, etc. before pushing to the gallery or Photos.app. Path is the absolute filesystem path (typically under ~/Pictures/Charmera/<date>/).",
         inputSchema: .object([
@@ -324,6 +347,75 @@ await server.withMethodHandler(CallTool.self) { params in
         case .failure(let error):
             return errText("Import failed: \(error.localizedDescription)")
         }
+
+    case "read_video_frame":
+        guard let path = params.arguments?["path"]?.stringValue else {
+            return errText("Missing 'path'.")
+        }
+        guard FileManager.default.fileExists(atPath: path) else {
+            return errText("File not found: \(path)")
+        }
+        let framePath = "\(NSTemporaryDirectory())charmera-frame-\(UUID().uuidString).jpg"
+        let extract = Process()
+        extract.executableURL = URL(fileURLWithPath: FFmpegManager.resolvedPath)
+        extract.arguments = ["-y", "-i", path, "-vframes", "1", framePath]
+        extract.standardOutput = FileHandle.nullDevice
+        extract.standardError = FileHandle.nullDevice
+        do {
+            try extract.run()
+            extract.waitUntilExit()
+        } catch {
+            return errText("ffmpeg launch failed: \(error.localizedDescription) (try: brew install ffmpeg)")
+        }
+        defer { try? FileManager.default.removeItem(atPath: framePath) }
+        guard extract.terminationStatus == 0,
+              let data = FileManager.default.contents(atPath: framePath) else {
+            return errText("ffmpeg could not extract a frame from \(path)")
+        }
+        return .init(content: [.image(data: data.base64EncodedString(), mimeType: "image/jpeg", annotations: nil, _meta: nil)], isError: false)
+
+    case "rotate_video":
+        guard let path = params.arguments?["path"]?.stringValue,
+              let degrees = params.arguments?["degrees"]?.intValue else {
+            return errText("Missing 'path' or 'degrees'.")
+        }
+        guard [90, 180, 270].contains(degrees) else {
+            return errText("'degrees' must be 90, 180, or 270.")
+        }
+        guard FileManager.default.fileExists(atPath: path) else {
+            return errText("File not found: \(path)")
+        }
+        let transpose: String
+        switch degrees {
+        case 90:  transpose = "transpose=1"
+        case 180: transpose = "transpose=2,transpose=2"
+        case 270: transpose = "transpose=2"
+        default:  transpose = "transpose=1"
+        }
+        let tmpOut = "\(path).rotating-\(UUID().uuidString).mp4"
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: FFmpegManager.resolvedPath)
+        proc.arguments = ["-y", "-i", path, "-vf", transpose, "-c:v", "h264_videotoolbox", "-b:v", "2M", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", tmpOut]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            return errText("ffmpeg launch failed: \(error.localizedDescription)")
+        }
+        guard proc.terminationStatus == 0,
+              FileManager.default.fileExists(atPath: tmpOut) else {
+            try? FileManager.default.removeItem(atPath: tmpOut)
+            return errText("ffmpeg failed (status \(proc.terminationStatus))")
+        }
+        do {
+            _ = try FileManager.default.replaceItemAt(URL(fileURLWithPath: path), withItemAt: URL(fileURLWithPath: tmpOut))
+        } catch {
+            try? FileManager.default.removeItem(atPath: tmpOut)
+            return errText("Could not replace original: \(error.localizedDescription)")
+        }
+        return .init(content: [jsonText(["rotated": true, "path": path, "degrees": degrees])], isError: false)
 
     case "read_photo":
         guard let path = params.arguments?["path"]?.stringValue else {

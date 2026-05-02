@@ -152,7 +152,7 @@ public class Importer {
                 // Just keep track of the AVI for counting purposes
                 continue
             }
-            convertAVItoMP4(input: aviPath, output: mp4Path)
+            convertAVItoMP4(input: aviPath, output: mp4Path, autoOrient: !skipOrientation)
             if fm.fileExists(atPath: mp4Path) {
                 convertedVideos.append(mp4Path)
             }
@@ -415,10 +415,33 @@ public class Importer {
 
     // MARK: - Video Conversion
 
-    private func convertAVItoMP4(input: String, output: String) {
-        print("[Importer] Converting \(input) to MP4")
+    private func convertAVItoMP4(input: String, output: String, autoOrient: Bool = true) {
         let ffmpeg = FFmpegManager.resolvedPath
-        let command = "\(shellEscape(ffmpeg)) -i \(shellEscape(input)) -c:v h264_videotoolbox -b:v 2M -c:a aac -b:a 128k -movflags +faststart -y \(shellEscape(output))"
+
+        var transposeFilter = ""
+        if autoOrient {
+            // The Charmera has no accelerometer, so the MP4 ships in whatever sensor
+            // orientation the camera was held. Sample the first frame, run the same
+            // Vision-based detector we use for stills, and bake the rotation into the
+            // re-encode via ffmpeg's transpose filter. Skipped when the caller is
+            // about to curate (e.g. charmera-mcp's prepare_camera_import).
+            let framePath = "\(NSTemporaryDirectory())charmera-frame-\(UUID().uuidString).jpg"
+            _ = runShell("\(shellEscape(ffmpeg)) -y -i \(shellEscape(input)) -vframes 1 \(shellEscape(framePath))")
+            let degrees = OrientationDetector.detectRotation(imagePath: framePath)
+            try? FileManager.default.removeItem(atPath: framePath)
+            switch degrees {
+            case 90:  transposeFilter = "-vf transpose=1 "
+            case 180: transposeFilter = "-vf transpose=2,transpose=2 "
+            case 270: transposeFilter = "-vf transpose=2 "
+            default:  break
+            }
+            if degrees != 0 {
+                print("[Importer] Rotating video by \(degrees)° during convert")
+            }
+        }
+
+        print("[Importer] Converting \(input) to MP4")
+        let command = "\(shellEscape(ffmpeg)) -i \(shellEscape(input)) \(transposeFilter)-c:v h264_videotoolbox -b:v 2M -c:a aac -b:a 128k -movflags +faststart -y \(shellEscape(output))"
         _ = runShell(command)
     }
 
