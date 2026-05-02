@@ -11,7 +11,7 @@
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.2.2</string>
+	<string>1.2.3</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleExecutable</key>
@@ -35,6 +35,8 @@
 	</array>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Charmera imports your camera photos into a "Charmera" album in Photos.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Charmera needs access to your Photos library to add imported photos to the "Charmera" album.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
