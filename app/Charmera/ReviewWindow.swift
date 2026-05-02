@@ -9,6 +9,12 @@ class ReviewPhoto: Identifiable, ObservableObject {
     let filePath: String
     let filename: String
     let dateFolder: String
+    /// Size of the local file at the moment we loaded the review window. We snapshot it
+    /// because a sips rotate later in `applyChanges` rewrites the file with a different
+    /// size — and the data.json hash key is `<filename>:<original-camera-size>`. Reading
+    /// the post-rotation size would miss the mapping and silently clobber an unrelated
+    /// older PICT0040.jpg-style entry.
+    let originalSize: Int64
     weak var parent: ReviewViewModel?
     @Published var rotation: Int = 0 { // 0, 90, 180, 270
         didSet { parent?.objectWillChange.send() }
@@ -21,10 +27,17 @@ class ReviewPhoto: Identifiable, ObservableObject {
         NSImage(contentsOfFile: filePath)
     }
 
+    /// Lookup key into data.json's hash field. Stable across rotations.
+    var dataKey: String {
+        "\(filename):\(originalSize)"
+    }
+
     init(filePath: String, dateFolder: String) {
         self.filePath = filePath
         self.filename = URL(fileURLWithPath: filePath).lastPathComponent
         self.dateFolder = dateFolder
+        let attrs = try? FileManager.default.attributesOfItem(atPath: filePath)
+        self.originalSize = (attrs?[.size] as? Int64) ?? (attrs?[.size] as? Int).map(Int64.init) ?? 0
     }
 
     func rotate90() {
@@ -93,9 +106,10 @@ class ReviewViewModel: ObservableObject {
     /// always target the correct gallery file — using the local filename blindly would
     /// hit an unrelated older entry and corrupt it.
     private func resolveRepoPath(api: GitHubAPI, owner: String, photo: ReviewPhoto, dataMap: [String: String]) -> (path: String, sha: String)? {
-        let attrs = try? FileManager.default.attributesOfItem(atPath: photo.filePath)
-        let size = (attrs?[.size] as? Int64) ?? (attrs?[.size] as? Int).map(Int64.init) ?? 0
-        let key = "\(photo.filename):\(size)"
+        // Use the size we snapshot at load time — sips rotates rewrite the file with a
+        // different size, which would miss data.json's hash key and silently clobber an
+        // unrelated older photo with the same camera filename.
+        let key = photo.dataKey
         if let mapped = dataMap[key] {
             let mappedPath = "docs/media/\(mapped)"
             if let sha = api.getFileSHA(owner: owner, repo: Config.repoName, path: mappedPath) {
