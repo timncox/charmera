@@ -189,6 +189,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         importItem.isEnabled = !isImporting && isCameraConnected
         menu.addItem(importItem)
 
+        let claudeItem = NSMenuItem(title: "Import via Claude…", action: #selector(importViaClaude), keyEquivalent: "")
+        claudeItem.target = self
+        claudeItem.isEnabled = !isImporting && isCameraConnected
+        claudeItem.toolTip = "Open a Claude Code session that drives the curated import flow via the bundled charmera-mcp server. Claude reviews each photo and video for orientation before pushing to the gallery and Photos.app."
+        menu.addItem(claudeItem)
+
         let review = NSMenuItem(title: "Review Photos", action: #selector(showReview), keyEquivalent: "r")
         review.target = self
         menu.addItem(review)
@@ -229,6 +235,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func importLocalOnlyAction() {
         handleImport()
+    }
+
+    /// Open Terminal and start a Claude Code session pre-loaded with a prompt that
+    /// drives the curated import flow via the bundled charmera-mcp server. Claude reads
+    /// each photo + video, decides orientation, rotates, then pushes to gallery + Photos.
+    @objc private func importViaClaude() {
+        let prompt = """
+        The Charmera camera is plugged in. Run a curated import using the charmera MCP server:
+        1. Call detect_camera to confirm the mount.
+        2. Call prepare_camera_import to copy new files locally without auto-orienting.
+        3. For each returned photo path, call read_photo and decide whether it needs rotation. If yes, call rotate_photo.
+        4. For each video path, call read_video_frame and call rotate_video if rotation is needed.
+        5. Build the data.json entry list, then call push_to_gallery with adds=[{localPath, galleryFilename}] for each file (use today's date suffix on collisions) and dataJsonEntries set to the merged list.
+        6. Call import_to_photos with the same paths.
+        Report counts of photos rotated, videos rotated, files pushed.
+        """
+        let appleScript = """
+        tell application "Terminal"
+            activate
+            do script "claude " & quoted form of "\(prompt.replacingOccurrences(of: "\"", with: "\\\""))"
+        end tell
+        """
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        proc.arguments = ["-e", appleScript]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Could not launch Claude Code"
+            alert.informativeText = "osascript failed to start Terminal: \(error.localizedDescription). Make sure Terminal.app and the `claude` CLI are both installed."
+            alert.runModal()
+        }
     }
 
     @objc private func ejectCamera() {
