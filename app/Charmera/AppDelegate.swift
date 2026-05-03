@@ -6,6 +6,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var pollTimer: Timer?
     private var isImporting = false
     private var importStatus: String = ""
+    /// Tracks the previous poll's camera state so we can fire an action on the
+    /// rising edge (false → true) without spamming on every 2-second tick.
+    private var lastCameraConnected: Bool = false
 
     private let setupController = SetupWindowController()
     private let prefsController = PreferencesWindowController()
@@ -27,8 +30,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         updateIcon()
 
+        lastCameraConnected = isCameraConnected
         pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.updateIcon()
+            guard let self = self else { return }
+            self.updateIcon()
+            self.checkCameraConnectTransition()
         }
 
         // Register for URL scheme callbacks
@@ -67,6 +73,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var isCameraConnected: Bool {
         Config.cameraVolumePath != nil
+    }
+
+    /// Fires once when the camera transitions from disconnected → connected.
+    /// Honors the `cameraConnectAction` user default: "none" (default), "auto"
+    /// (run the standard import), or "claude" (open Terminal with a curated
+    /// Claude Code session driving the charmera-mcp tools).
+    private func checkCameraConnectTransition() {
+        let now = isCameraConnected
+        defer { lastCameraConnected = now }
+        guard now, !lastCameraConnected, !isImporting else { return }
+        let action = UserDefaults.standard.string(forKey: "cameraConnectAction") ?? "none"
+        switch action {
+        case "auto":
+            handleImport()
+        case "claude":
+            importViaClaude()
+        default:
+            break
+        }
     }
 
     private func updateIcon() {

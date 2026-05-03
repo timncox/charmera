@@ -11,6 +11,7 @@ struct PreferencesView: View {
     @State private var deleteFromCamera: Bool = UserDefaults.standard.object(forKey: "deleteFromCamera") as? Bool ?? true
     @State private var reviewBeforeUpload: Bool = UserDefaults.standard.object(forKey: "reviewBeforeUpload") as? Bool ?? false
     @State private var localOnly: Bool = UserDefaults.standard.object(forKey: "localOnly") as? Bool ?? false
+    @State private var cameraConnectAction: String = UserDefaults.standard.string(forKey: "cameraConnectAction") ?? "none"
     private let username = KeychainHelper.githubUsername ?? "unknown"
 
     private var galleryURL: String {
@@ -64,6 +65,17 @@ struct PreferencesView: View {
                 .onChange(of: localOnly) { _, newValue in
                     UserDefaults.standard.set(newValue, forKey: "localOnly")
                 }
+
+            // Camera-connect behavior
+            Picker("On camera connect:", selection: $cameraConnectAction) {
+                Text("Do nothing").tag("none")
+                Text("Auto-import").tag("auto")
+                Text("Open Claude curated import…").tag("claude")
+            }
+            .pickerStyle(.menu)
+            .onChange(of: cameraConnectAction) { _, newValue in
+                UserDefaults.standard.set(newValue, forKey: "cameraConnectAction")
+            }
 
             Divider()
 
