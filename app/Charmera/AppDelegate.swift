@@ -276,10 +276,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         6. Call import_to_photos with the same paths.
         Report counts of photos rotated, videos rotated, files pushed.
         """
+        // Optional working directory — claude is project-scoped (cwd matters for file
+        // refs and project-level config overrides). The charmera-mcp server is at user
+        // scope so it's available regardless, but the user usually wants claude launched
+        // from their projects root. Empty = Terminal default.
+        let workingDir = UserDefaults.standard.string(forKey: "claudeWorkingDir") ?? ""
+        let cdPrefix: String
+        if workingDir.isEmpty {
+            cdPrefix = ""
+        } else {
+            let expanded = NSString(string: workingDir).expandingTildeInPath
+            // Single-quote the path; escape any embedded single quotes via the standard
+            // shell-quoting trick. This builds: `cd '<path>' && `
+            let escaped = expanded.replacingOccurrences(of: "'", with: "'\\''")
+            cdPrefix = "cd '\(escaped)' && "
+        }
+
         let appleScript = """
         tell application "Terminal"
             activate
-            do script "claude " & quoted form of "\(prompt.replacingOccurrences(of: "\"", with: "\\\""))"
+            do script "\(cdPrefix)claude " & quoted form of "\(prompt.replacingOccurrences(of: "\"", with: "\\\""))"
         end tell
         """
         let proc = Process()

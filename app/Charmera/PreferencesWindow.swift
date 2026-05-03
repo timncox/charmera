@@ -12,6 +12,7 @@ struct PreferencesView: View {
     @State private var reviewBeforeUpload: Bool = UserDefaults.standard.object(forKey: "reviewBeforeUpload") as? Bool ?? false
     @State private var localOnly: Bool = UserDefaults.standard.object(forKey: "localOnly") as? Bool ?? false
     @State private var cameraConnectAction: String = UserDefaults.standard.string(forKey: "cameraConnectAction") ?? "none"
+    @State private var claudeWorkingDir: String = UserDefaults.standard.string(forKey: "claudeWorkingDir") ?? ""
     private let username = KeychainHelper.githubUsername ?? "unknown"
 
     private var galleryURL: String {
@@ -75,6 +76,34 @@ struct PreferencesView: View {
             .pickerStyle(.menu)
             .onChange(of: cameraConnectAction) { _, newValue in
                 UserDefaults.standard.set(newValue, forKey: "cameraConnectAction")
+            }
+
+            // Claude working directory — `claude` is project-scoped (uses cwd for file
+            // refs, project-level config overrides, conversation context). The
+            // charmera-mcp server is registered at user scope in ~/.claude.json so it's
+            // available anywhere, but you usually want claude launched from your projects
+            // root. Empty = Terminal's default (home).
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Claude working directory:")
+                    Spacer()
+                    Button("Choose…") {
+                        let panel = NSOpenPanel()
+                        panel.canChooseDirectories = true
+                        panel.canChooseFiles = false
+                        panel.allowsMultipleSelection = false
+                        panel.directoryURL = URL(fileURLWithPath: NSString(string: claudeWorkingDir.isEmpty ? "~" : claudeWorkingDir).expandingTildeInPath)
+                        if panel.runModal() == .OK, let url = panel.url {
+                            claudeWorkingDir = url.path
+                            UserDefaults.standard.set(claudeWorkingDir, forKey: "claudeWorkingDir")
+                        }
+                    }
+                }
+                TextField("e.g. ~/tim-os (empty = Terminal default)", text: $claudeWorkingDir)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit {
+                        UserDefaults.standard.set(claudeWorkingDir, forKey: "claudeWorkingDir")
+                    }
             }
 
             Divider()
