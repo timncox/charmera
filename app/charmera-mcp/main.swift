@@ -89,14 +89,16 @@ let tools: [Tool] = [
     ),
     Tool(
         name: "push_to_gallery",
-        description: "Upload, rotate, or delete files in the GitHub gallery in a single commit (one Pages build). Adds are local file paths uploaded to docs/media/. Deletes are gallery filenames (the bare name, not docs/media/<name>). Optionally updates data.json entries by passing dataJsonEntries (replaces the whole array).",
+        description: "Upload, rotate, or delete files in the GitHub gallery in a single commit (one Pages build). Adds are local file paths uploaded to docs/media/. Deletes are gallery filenames (the bare name, not docs/media/<name>). Use appendEntries to add new rows to data.json — the server fetches the existing array, merges, and pushes the result, so you don't need to pass the whole gallery back through the tool call. removeEntryFilenames drops matching rows. dataJsonEntries (full replace) is still available for cases where you need to overwrite the whole array.",
         inputSchema: .object([
             "type": .string("object"),
             "properties": .object([
                 "adds": .object(["type": .string("array"), "items": .object(["type": .string("object"), "properties": .object(["localPath": .object(["type": .string("string")]), "galleryFilename": .object(["type": .string("string")])])])]),
                 "deletes": .object(["type": .string("array"), "items": .object(["type": .string("string")])]),
                 "message": .object(["type": .string("string"), "description": .string("Commit message")]),
-                "dataJsonEntries": .object(["type": .string("array"), "description": .string("Optional. If provided, replaces docs/data.json with these entries. Each entry is {type, filename, url, hash, timestamp}.")]),
+                "appendEntries": .object(["type": .string("array"), "description": .string("Recommended for new uploads. New data.json rows to append; the server merges with the existing array. Each entry is {type, filename, url, hash, timestamp}.")]),
+                "removeEntryFilenames": .object(["type": .string("array"), "items": .object(["type": .string("string")]), "description": .string("Filenames to drop from data.json during the merge. Independent of `deletes` (which removes the file blob).")]),
+                "dataJsonEntries": .object(["type": .string("array"), "description": .string("Escape hatch: if provided, replaces docs/data.json wholesale with these entries. Prefer appendEntries + removeEntryFilenames for normal flows."), "deprecated": .bool(true)]),
             ]),
             "required": .array([.string("message")]),
         ])
@@ -288,10 +290,9 @@ await server.withMethodHandler(CallTool.self) { params in
             }
         }
 
-        // Optional data.json replacement
-        if let entries = params.arguments?["dataJsonEntries"]?.arrayValue {
-            // Convert MCP Value array → plain array → JSON
-            let plain: [[String: Any]] = entries.compactMap { v in
+        // Helper: flatten an MCP Value array of objects into [[String: Any]] of strings.
+        func flattenEntries(_ values: [Value]) -> [[String: Any]] {
+            return values.compactMap { v in
                 guard let obj = v.objectValue else { return nil }
                 var dict: [String: Any] = [:]
                 for (k, vv) in obj {
@@ -301,13 +302,54 @@ await server.withMethodHandler(CallTool.self) { params in
                 }
                 return dict
             }
-            if let json = try? JSONSerialization.data(withJSONObject: plain, options: [.prettyPrinted, .sortedKeys]) {
+        }
+
+        let appendEntries = params.arguments?["appendEntries"]?.arrayValue.map(flattenEntries) ?? []
+        var removeFilenames = Set<String>()
+        if let arr = params.arguments?["removeEntryFilenames"]?.arrayValue {
+            for v in arr { if let s = v.stringValue { removeFilenames.insert(s) } }
+        }
+        let fullReplace = params.arguments?["dataJsonEntries"]?.arrayValue.map(flattenEntries)
+
+        // Build the new data.json. Three modes:
+        //   1. dataJsonEntries provided → wholesale replace (legacy escape hatch).
+        //   2. appendEntries / removeEntryFilenames provided → fetch current, merge.
+        //   3. neither → don't touch data.json.
+        if let replacement = fullReplace {
+            if let json = try? JSONSerialization.data(withJSONObject: replacement, options: [.prettyPrinted, .sortedKeys]) {
+                filesToUpload.append((path: "docs/data.json", content: json))
+            }
+        } else if !appendEntries.isEmpty || !removeFilenames.isEmpty {
+            // Fold deleted blobs into the entry-removal set so a single `deletes` arg
+            // also drops the corresponding data.json row.
+            for path in deletes {
+                let basename = (path as NSString).lastPathComponent
+                removeFilenames.insert(basename)
+            }
+            // Pull current array, drop matching filenames, append new ones.
+            var existing: [[String: Any]] = []
+            if let data = api.downloadFile(owner: auth.username, repo: Config.repoName, path: "docs/data.json"),
+               let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+                existing = arr
+            }
+            existing.removeAll { entry in
+                guard let f = entry["filename"] as? String else { return false }
+                return removeFilenames.contains(f)
+            }
+            // De-dupe new appends against existing filenames so re-runs don't double-list.
+            let existingNames = Set(existing.compactMap { $0["filename"] as? String })
+            let toAppend = appendEntries.filter {
+                guard let f = $0["filename"] as? String else { return false }
+                return !existingNames.contains(f)
+            }
+            let merged = existing + toAppend
+            if let json = try? JSONSerialization.data(withJSONObject: merged, options: [.prettyPrinted, .sortedKeys]) {
                 filesToUpload.append((path: "docs/data.json", content: json))
             }
         }
 
         guard !filesToUpload.isEmpty || !deletes.isEmpty else {
-            return errText("Nothing to push: provide at least one of adds, deletes, or dataJsonEntries.")
+            return errText("Nothing to push: provide at least one of adds, deletes, appendEntries, removeEntryFilenames, or dataJsonEntries.")
         }
 
         do {
