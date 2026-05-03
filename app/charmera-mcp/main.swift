@@ -69,10 +69,14 @@ let tools: [Tool] = [
     ),
     Tool(
         name: "read_gallery_data",
-        description: "Fetch the gallery's data.json from GitHub. Returns the array of all media entries (filename, url, type, hash, timestamp). Use this to answer questions about what has been imported.",
+        description: "Fetch entries from the gallery's data.json on GitHub. Defaults to the last 50 entries (chronological tail) — the full file is ~115KB / ~50K tokens at 600+ entries and dominates context if you don't need it all. Pass `all: true` to get the whole array, or `tail: N` for a specific count, or `filenamePrefix` to filter.",
         inputSchema: .object([
             "type": .string("object"),
-            "properties": .object([:]),
+            "properties": .object([
+                "tail": .object(["type": .string("integer"), "description": .string("Return the last N entries. Default 50. Ignored if all=true."), "default": .int(50)]),
+                "all": .object(["type": .string("boolean"), "description": .string("Return the full array. Use sparingly — large galleries blow past tool-result size limits."), "default": .bool(false)]),
+                "filenamePrefix": .object(["type": .string("string"), "description": .string("Return only entries whose filename starts with this string. Combine with all/tail for additional filtering.")]),
+            ]),
         ])
     ),
     Tool(
@@ -161,12 +165,35 @@ let tools: [Tool] = [
     ),
     Tool(
         name: "prepare_camera_import",
-        description: "Phase 1 of a curated import: copy new photos+videos from the camera to a local backup folder WITHOUT auto-orientation, GitHub upload, or Photos.app import. Returns the list of local paths the model can read_photo + rotate_photo, then push via push_to_gallery + import_to_photos. Updates the imported-hashes file so a later import_roll won't double-copy.",
+        description: "Phase 1 of a curated import: copy new photos+videos from the camera to a local backup folder WITHOUT auto-orientation, GitHub upload, or Photos.app import. Returns per-file metadata (path, size, mtime ISO, kind, suggested hash) so the caller doesn't re-stat. Subsequent flow: read_photo / read_video_frame on each → rotate_photo / rotate_video where needed → commit_curated_files (server handles collision-renaming, hash, timestamp, data.json merge) → import_to_photos.",
         inputSchema: .object([
             "type": .string("object"),
             "properties": .object([
                 "skipVideoConversion": .object(["type": .string("boolean"), "description": .string("Skip AVI→MP4 conversion (default false)"), "default": .bool(false)]),
             ]),
+        ])
+    ),
+    Tool(
+        name: "commit_curated_files",
+        description: "Recommended single-call commit for curated imports. Pass local file paths + a commit message; the server does everything: reads file size + mtime, names each blob with date-suffix collision rename when needed, generates `<filename>:<size>` hashes, builds data.json entries with ISO timestamps from mtime, merges with the existing data.json, and pushes one batched commit (one Pages build). Caller stays out of state management — no array merging, no timestamp guessing, no naming convention to follow. Returns the commit SHA + the per-file resolved {localPath, galleryFilename, hash, timestamp} report so the caller can chain into import_to_photos.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "files": .object([
+                    "type": .string("array"),
+                    "items": .object([
+                        "type": .string("object"),
+                        "properties": .object([
+                            "path": .object(["type": .string("string"), "description": .string("Absolute path to a local file under ~/Pictures/Charmera/<date>/")]),
+                            "type": .object(["type": .string("string"), "enum": .array([.string("photo"), .string("video")]), "description": .string("Optional. Inferred from extension when omitted (.mp4/.mov/.m4v → video, else → photo).")]),
+                        ]),
+                        "required": .array([.string("path")]),
+                    ]),
+                ]),
+                "deletes": .object(["type": .string("array"), "items": .object(["type": .string("string")]), "description": .string("Gallery filenames (no docs/media/ prefix) to delete from both the file blobs and the data.json array.")]),
+                "message": .object(["type": .string("string"), "description": .string("Commit message")]),
+            ]),
+            "required": .array([.string("message")]),
         ])
     ),
     Tool(
@@ -228,11 +255,30 @@ await server.withMethodHandler(CallTool.self) { params in
             return errText("Not signed in to GitHub. Open the Charmera menu-bar app to authenticate.")
         }
         let api = GitHubAPI(token: auth.token)
-        guard let data = api.downloadFile(owner: auth.username, repo: Config.repoName, path: "docs/data.json") else {
-            return errText("Could not download docs/data.json from \(auth.username)/\(Config.repoName).")
+        guard let data = api.downloadFile(owner: auth.username, repo: Config.repoName, path: "docs/data.json"),
+              let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return errText("Could not download or parse docs/data.json from \(auth.username)/\(Config.repoName).")
         }
-        let str = String(data: data, encoding: .utf8) ?? "[]"
-        return .init(content: [text(str)], isError: false)
+        let totalCount = entries.count
+        let returnAll = params.arguments?["all"]?.boolValue ?? false
+        let tailCount = params.arguments?["tail"]?.intValue ?? 50
+        let prefix = params.arguments?["filenamePrefix"]?.stringValue
+
+        var working = entries
+        if let p = prefix {
+            working = working.filter { ($0["filename"] as? String)?.hasPrefix(p) ?? false }
+        }
+        if !returnAll {
+            let n = max(0, min(tailCount, working.count))
+            working = Array(working.suffix(n))
+        }
+        let payload: [String: Any] = [
+            "totalEntries": totalCount,
+            "returned": working.count,
+            "truncated": !returnAll && (working.count < totalCount),
+            "entries": working,
+        ]
+        return .init(content: [jsonText(payload)], isError: false)
 
     case "rotate_photo":
         guard let path = params.arguments?["path"]?.stringValue,
@@ -519,15 +565,183 @@ await server.withMethodHandler(CallTool.self) { params in
         )
         switch result {
         case .success(let counts):
+            let isoFormatter = ISO8601DateFormatter()
+            isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let fm = FileManager.default
+            var enriched: [[String: Any]] = []
+            for path in counts.localPaths {
+                let url = URL(fileURLWithPath: path)
+                let filename = url.lastPathComponent
+                let attrs = (try? fm.attributesOfItem(atPath: path)) ?? [:]
+                let size = (attrs[.size] as? Int64) ?? (attrs[.size] as? Int).map(Int64.init) ?? 0
+                let mtime = (attrs[.modificationDate] as? Date) ?? Date()
+                let ext = url.pathExtension.lowercased()
+                let kind = (ext == "mp4" || ext == "mov" || ext == "m4v") ? "video" : "photo"
+                enriched.append([
+                    "path": path,
+                    "filename": filename,
+                    "size": size,
+                    "mtimeISO": isoFormatter.string(from: mtime),
+                    "kind": kind,
+                    "suggestedHash": "\(filename):\(size)",
+                ])
+            }
             return .init(content: [jsonText([
                 "photos": counts.photos,
                 "videos": counts.videos,
-                "localPaths": counts.localPaths,
+                "files": enriched,
                 "status": statusLog,
-                "nextSteps": "For each photo: read_photo → rotate_photo (if needed). Then push_to_gallery + import_to_photos with the final paths.",
+                "nextSteps": "For each photo: read_photo → rotate_photo (if needed). For each video: read_video_frame → rotate_video (if needed). Then commit_curated_files {files: [{path}], message} — server handles collision rename, hash, timestamp, data.json merge in one commit. Finally import_to_photos with the same paths.",
             ])], isError: false)
         case .failure(let error):
             return errText("prepare_camera_import failed: \(error.localizedDescription)")
+        }
+
+    case "commit_curated_files":
+        guard let auth = githubAuth() else {
+            return errText("Not signed in to GitHub.")
+        }
+        guard let message = params.arguments?["message"]?.stringValue else {
+            return errText("Missing 'message'.")
+        }
+        guard let filesArr = params.arguments?["files"]?.arrayValue, !filesArr.isEmpty else {
+            // Allow deletes-only commits, fall through to deletes path below
+            if (params.arguments?["deletes"]?.arrayValue ?? []).isEmpty {
+                return errText("Provide either 'files' or 'deletes' (or both).")
+            }
+            return errText("'files' is required for now in commit_curated_files. For pure deletes use push_to_gallery.")
+        }
+        let api = GitHubAPI(token: auth.token)
+        let isoFormatter = ISO8601DateFormatter()
+        isoFormatter.formatOptions = [.withInternetDateTime]
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd"
+        let fm = FileManager.default
+
+        // Pull current remote tree once for collision detection.
+        let existingRemoteNames = api.listDirectoryFilenames(owner: auth.username, repo: Config.repoName, path: "docs/media") ?? Set<String>()
+        var plannedNames = Set<String>()
+        var filesToUpload: [(path: String, content: Data)] = []
+        var newEntries: [[String: Any]] = []
+        var report: [[String: Any]] = []
+        var skipped: [[String: Any]] = []
+
+        for entry in filesArr {
+            guard let dict = entry.objectValue,
+                  let localPath = dict["path"]?.stringValue else {
+                skipped.append(["reason": "missing path", "entry": String(describing: entry)])
+                continue
+            }
+            guard let data = fm.contents(atPath: localPath) else {
+                skipped.append(["path": localPath, "reason": "could not read file"])
+                continue
+            }
+            let url = URL(fileURLWithPath: localPath)
+            let filename = url.lastPathComponent
+            let size = data.count
+            let attrs = (try? fm.attributesOfItem(atPath: localPath)) ?? [:]
+            let mtime = (attrs[.modificationDate] as? Date) ?? Date()
+            let timestampISO = isoFormatter.string(from: mtime)
+            let dateFolder = dateFormatter.string(from: mtime)
+            let hash = "\(filename):\(size)"
+
+            let extLower = url.pathExtension.lowercased()
+            let inferredType = (extLower == "mp4" || extLower == "mov" || extLower == "m4v") ? "video" : "photo"
+            let type = dict["type"]?.stringValue ?? inferredType
+
+            // Collision-rename: append _<dateFolder>, then _<dateFolder>_2, _3, … on
+            // further collision against either the live remote tree or names already
+            // claimed earlier in this same commit.
+            var uploadFilename = filename
+            let isTaken: (String) -> Bool = { existingRemoteNames.contains($0) || plannedNames.contains($0) }
+            if isTaken(uploadFilename) {
+                let nameOnly = (filename as NSString).deletingPathExtension
+                let extPart = (filename as NSString).pathExtension
+                var counter = 1
+                while true {
+                    let suffix = counter == 1 ? dateFolder : "\(dateFolder)_\(counter)"
+                    uploadFilename = extPart.isEmpty ? "\(nameOnly)_\(suffix)" : "\(nameOnly)_\(suffix).\(extPart)"
+                    if !isTaken(uploadFilename) { break }
+                    counter += 1
+                }
+            }
+            plannedNames.insert(uploadFilename)
+
+            filesToUpload.append((path: "docs/media/\(uploadFilename)", content: data))
+            let newEntry: [String: Any] = [
+                "type": type,
+                "filename": uploadFilename,
+                "url": "media/\(uploadFilename)",
+                "hash": hash,
+                "timestamp": timestampISO,
+            ]
+            newEntries.append(newEntry)
+            report.append([
+                "localPath": localPath,
+                "galleryFilename": uploadFilename,
+                "hash": hash,
+                "timestamp": timestampISO,
+                "type": type,
+                "size": size,
+            ])
+        }
+
+        // Optional deletes (file blobs + corresponding data.json rows).
+        var deletePaths: [String] = []
+        var removedNames = Set<String>()
+        if let arr = params.arguments?["deletes"]?.arrayValue {
+            for v in arr {
+                guard let s = v.stringValue else { continue }
+                deletePaths.append("docs/media/\(s)")
+                removedNames.insert(s)
+            }
+        }
+
+        // Merge data.json: drop removed rows, append new entries.
+        var existingEntries: [[String: Any]] = []
+        if let data = api.downloadFile(owner: auth.username, repo: Config.repoName, path: "docs/data.json"),
+           let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            existingEntries = arr
+        }
+        existingEntries.removeAll { entry in
+            guard let f = entry["filename"] as? String else { return false }
+            return removedNames.contains(f)
+        }
+        // Dedupe new entries against existing filenames so retries are idempotent.
+        let existingNames = Set(existingEntries.compactMap { $0["filename"] as? String })
+        let toAppend = newEntries.filter {
+            guard let f = $0["filename"] as? String else { return false }
+            return !existingNames.contains(f)
+        }
+        let merged = existingEntries + toAppend
+        if let json = try? JSONSerialization.data(withJSONObject: merged, options: [.prettyPrinted, .sortedKeys]) {
+            filesToUpload.append((path: "docs/data.json", content: json))
+        }
+
+        guard !filesToUpload.isEmpty || !deletePaths.isEmpty else {
+            return errText("Nothing to push: no readable files and no deletes.")
+        }
+
+        do {
+            let sha = try api.uploadFilesAsOneCommit(
+                owner: auth.username,
+                repo: Config.repoName,
+                branch: "main",
+                files: filesToUpload,
+                deletions: deletePaths,
+                message: message
+            )
+            return .init(content: [jsonText([
+                "commit": sha,
+                "pagesUrl": "https://\(auth.username).github.io/\(Config.repoName)/",
+                "uploaded": report.count,
+                "deleted": deletePaths.count,
+                "dataJsonRows": merged.count,
+                "files": report,
+                "skipped": skipped,
+            ])], isError: false)
+        } catch {
+            return errText("Push failed: \(error.localizedDescription)")
         }
 
     case "auth_status":
